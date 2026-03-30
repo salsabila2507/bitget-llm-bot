@@ -409,7 +409,7 @@ def run():
                         continue
                     decision = ask_llm_monitor(pos, mdata)
                     logger.info(f"LLM monitor {sym}: {decision}")
-                    if decision.get("decision") == "CLOSE":
+                    if pnl >= 1.0 or decision.get("decision") == "CLOSE":
                         close_side = "sell" if hold == "long" else "buy"
                         res = place_order(sym, close_side, "close", total, hold)
                         if res.get("code") == "00000":
