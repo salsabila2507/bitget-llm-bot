@@ -1,4 +1,4 @@
-import time, logging, json, requests, hmac, hashlib, base64, math, threading
+import time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -21,10 +21,73 @@ MARGIN_MODE   = "isolated"
 PRODUCT_TYPE  = "USDT-FUTURES"
 MARGIN_COIN   = "USDT"
 SLEEP_MINUTES = 15
+DB_PATH       = "/root/trade_history.db"
 
-bot_running   = True
+bot_running    = True
 last_update_id = 0
 
+# ── Database ──────────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT, action TEXT, entry_price REAL,
+        exit_price REAL, size REAL, pnl REAL,
+        opened_at TEXT, closed_at TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+def save_trade_open(symbol, action, entry_price, size):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO trades (symbol, action, entry_price, size, opened_at) VALUES (?,?,?,?,?)",
+        (symbol, action, entry_price, size, time.strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+def save_trade_close(symbol, exit_price, pnl):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
+        (exit_price, pnl, time.strftime("%Y-%m-%d %H:%M:%S"), symbol)
+    )
+    conn.commit()
+    conn.close()
+
+def get_trade_summary():
+    conn = sqlite3.connect(DB_PATH)
+    trades = conn.execute(
+        "SELECT symbol, action, pnl FROM trades WHERE pnl IS NOT NULL ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+    if not trades:
+        return None
+    total   = len(trades)
+    wins    = [t for t in trades if t[2] > 0]
+    losses  = [t for t in trades if t[2] <= 0]
+    win_rate = round(len(wins) / total * 100, 1)
+    avg_pnl  = round(sum(t[2] for t in trades) / total, 4)
+    # Best/worst pair
+    from collections import defaultdict
+    pair_pnl = defaultdict(list)
+    for t in trades:
+        pair_pnl[t[0]].append(t[2])
+    pair_avg = {k: sum(v)/len(v) for k, v in pair_pnl.items()}
+    best  = max(pair_avg, key=pair_avg.get)
+    worst = min(pair_avg, key=pair_avg.get)
+    history = "\n".join([f"- {t[0]} {t[1]}: {'+'if t[2]>0 else ''}{t[2]:.4f} USDT" for t in trades[:10]])
+    return {
+        "total_trades": total,
+        "win_rate": f"{win_rate}%",
+        "avg_pnl": avg_pnl,
+        "best_pair": best,
+        "worst_pair": worst,
+        "last_10": history,
+    }
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(msg):
     try:
         requests.post(
@@ -50,6 +113,7 @@ def get_telegram_updates():
     except:
         return []
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
 def sign(method, path, body=""):
     ts  = str(int(time.time() * 1000))
     msg = ts + method.upper() + path + (body if body else "")
@@ -74,6 +138,7 @@ def api_post(path, body):
     r = requests.post(BASE_URL + path, headers=sign("POST", path, s), data=s, timeout=10)
     return r.json()
 
+# ── Account ───────────────────────────────────────────────────────────────────
 def get_balance():
     res = api_get(f"/api/v2/mix/account/accounts?productType={PRODUCT_TYPE}")
     if res.get("code") == "00000":
@@ -82,6 +147,7 @@ def get_balance():
                 return float(a["available"])
     return 0.0
 
+# ── Market ────────────────────────────────────────────────────────────────────
 def get_all_tickers():
     res = api_get(f"/api/v2/mix/market/tickers?productType={PRODUCT_TYPE}")
     if res.get("code") == "00000":
@@ -136,9 +202,20 @@ def get_market_data(symbol, ticker):
         "rsi":         round(rsi, 2),
     }
 
-def ask_llm_open(all_data):
+# ── LLM ───────────────────────────────────────────────────────────────────────
+def ask_llm_open(all_data, summary):
+    history_ctx = ""
+    if summary:
+        history_ctx = f"""
+Your trading history (last 20 trades):
+{summary['last_10']}
+Win rate: {summary['win_rate']} | Avg PnL: {summary['avg_pnl']} USDT
+Best pair: {summary['best_pair']} | Worst pair: {summary['worst_pair']}
+Use this history to make a better decision. Avoid pairs that consistently lose.
+"""
     prompt = f"""You are a crypto futures trader analyzing cheap coins (price < $1).
-Pick the single BEST trade opportunity from this data:
+{history_ctx}
+Pick the single BEST trade opportunity from this market data:
 {json.dumps(all_data, indent=2)}
 Reply ONLY valid JSON:
 {{"action":"LONG or SHORT","pair":"SYMBOL","confidence":1-10,"reason":"brief"}}"""
@@ -156,9 +233,9 @@ Reply ONLY valid JSON:
     return json.loads(text.strip())
 
 def ask_llm_monitor(position, market_data):
-    sym  = position["symbol"]
-    hold = position.get("holdSide", "long")
-    pnl  = float(position.get("unrealizedPL", 0))
+    sym   = position["symbol"]
+    hold  = position.get("holdSide", "long")
+    pnl   = float(position.get("unrealizedPL", 0))
     entry = float(position.get("openPriceAvg", 0))
     prompt = f"""You are managing an open futures position.
 Position: {hold.upper()} {sym}
@@ -181,6 +258,7 @@ Reply ONLY valid JSON:
             text = text[4:]
     return json.loads(text.strip())
 
+# ── Trade ─────────────────────────────────────────────────────────────────────
 def get_positions():
     res = api_get(f"/api/v2/mix/position/all-position?productType={PRODUCT_TYPE}&marginCoin={MARGIN_COIN}")
     if res.get("code") == "00000":
@@ -237,20 +315,21 @@ def close_all_positions():
         hold  = pos.get("holdSide", "long")
         side  = "sell" if hold == "long" else "buy"
         pnl   = float(pos.get("unrealizedPL", 0))
+        price = float(pos.get("markPrice", 0))
         res   = place_order(sym, side, "close", total, hold)
         if res.get("code") == "00000":
+            save_trade_close(sym, price, pnl)
             send_telegram(f"🔴 <b>CLOSED</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>")
-        else:
-            send_telegram(f"⚠️ Gagal close {sym}: {res.get('msg')}")
 
+# ── Telegram commands ─────────────────────────────────────────────────────────
 def handle_commands():
     global bot_running
     while bot_running:
         updates = get_telegram_updates()
         for u in updates:
-            msg = u.get("message", {})
+            msg     = u.get("message", {})
             chat_id = str(msg.get("chat", {}).get("id", ""))
-            text = msg.get("text", "").strip().lower()
+            text    = msg.get("text", "").strip().lower()
             if chat_id != TELEGRAM_CHAT_ID:
                 continue
             if text == "/status":
@@ -267,6 +346,20 @@ def handle_commands():
             elif text == "/balance":
                 balance = get_balance()
                 send_telegram(f"💰 Balance: <b>{balance:.4f} USDT</b>")
+            elif text == "/history":
+                summary = get_trade_summary()
+                if not summary:
+                    send_telegram("📈 Belum ada history trade.")
+                else:
+                    send_telegram(
+                        f"📈 <b>Trade History</b>\n"
+                        f"Total trades: {summary['total_trades']}\n"
+                        f"Win rate: <b>{summary['win_rate']}</b>\n"
+                        f"Avg PnL: <b>{summary['avg_pnl']} USDT</b>\n"
+                        f"Best pair: <b>{summary['best_pair']}</b>\n"
+                        f"Worst pair: <b>{summary['worst_pair']}</b>\n\n"
+                        f"Last 10:\n{summary['last_10']}"
+                    )
             elif text == "/close":
                 send_telegram("⏳ Menutup semua posisi...")
                 close_all_positions()
@@ -278,17 +371,19 @@ def handle_commands():
                     "📋 <b>Commands:</b>\n"
                     "/status — posisi aktif + PnL\n"
                     "/balance — cek balance\n"
+                    "/history — trade history + win rate\n"
                     "/close — close semua posisi\n"
                     "/stop — stop bot"
                 )
         time.sleep(2)
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 def run():
     global bot_running
+    init_db()
     logger.info("=== Bitget LLM Trading Bot Started ===")
     send_telegram("🤖 <b>Bitget LLM Bot Started</b>\nKetik /help untuk daftar perintah.")
 
-    # Jalankan thread telegram listener
     t = threading.Thread(target=handle_commands, daemon=True)
     t.start()
 
@@ -298,6 +393,7 @@ def run():
             logger.info(f"Balance: {balance} USDT")
             tickers   = get_all_tickers()
             positions = get_positions()
+            summary   = get_trade_summary()
 
             if positions:
                 for pos in positions:
@@ -305,9 +401,10 @@ def run():
                     hold  = pos.get("holdSide", "long")
                     pnl   = float(pos.get("unrealizedPL", 0))
                     total = float(pos.get("total", 0))
+                    price = float(pos.get("markPrice", 0))
                     logger.info(f"Position: {hold.upper()} {sym} | PnL: {pnl:.4f} USDT")
-                    ticker = tickers.get(sym, {})
-                    mdata  = get_market_data(sym, ticker) if ticker else None
+                    ticker   = tickers.get(sym, {})
+                    mdata    = get_market_data(sym, ticker) if ticker else None
                     if not mdata:
                         continue
                     decision = ask_llm_monitor(pos, mdata)
@@ -316,6 +413,7 @@ def run():
                         close_side = "sell" if hold == "long" else "buy"
                         res = place_order(sym, close_side, "close", total, hold)
                         if res.get("code") == "00000":
+                            save_trade_close(sym, price, pnl)
                             logger.info(f"Closed {sym} PnL: {pnl:.4f}")
                             send_telegram(f"🔴 <b>CLOSE</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>\nReason: {decision.get('reason')}")
                         else:
@@ -342,7 +440,7 @@ def run():
                     all_data.append(d)
             logger.info(f"Got data for {len(all_data)} pairs")
 
-            decision   = ask_llm_open(all_data)
+            decision   = ask_llm_open(all_data, summary)
             logger.info(f"LLM open: {json.dumps(decision, indent=2)}")
 
             action     = decision.get("action", "").upper()
@@ -366,6 +464,7 @@ def run():
             set_leverage(symbol, leverage)
             res = place_order(symbol, side, "open", size, pos_side)
             if res.get("code") == "00000":
+                save_trade_open(symbol, action, price, size)
                 logger.info(f"✅ {action} {size} {symbol} @ {leverage}x")
                 send_telegram(f"🟢 <b>{action}</b> {symbol}\nSize: {size} @ {leverage}x\nReason: {decision.get('reason')}")
             else:
