@@ -20,11 +20,12 @@ MAX_PRICE     = 1.0
 MARGIN_MODE   = "isolated"
 PRODUCT_TYPE  = "USDT-FUTURES"
 MARGIN_COIN   = "USDT"
-SLEEP_MINUTES = 15
+SLEEP_MINUTES = 5
 DB_PATH       = "/root/trade_history.db"
 
 bot_running    = True
 last_update_id = 0
+force_trade    = False
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -53,6 +54,43 @@ def save_trade_close(symbol, exit_price, pnl):
         "UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
         (exit_price, pnl, time.strftime("%Y-%m-%d %H:%M:%S"), symbol)
     )
+    conn.commit()
+    conn.close()
+
+def sync_closed_trades():
+    """Sync trade history dari Bitget ke database lokal"""
+    conn = sqlite3.connect(DB_PATH)
+    res = api_get(f"/api/v2/mix/order/orders-history?productType={PRODUCT_TYPE}&limit=20")
+    if res.get("code") != "00000":
+        conn.close()
+        return
+    orders = res.get("data", {}).get("entrustedList", [])
+    for o in orders:
+        if o.get("state") != "filled":
+            continue
+        order_id  = o.get("orderId")
+        symbol    = o.get("symbol")
+        side      = o.get("side")
+        trade_side = o.get("tradeSide", "")
+        price     = float(o.get("priceAvg", 0))
+        size      = float(o.get("baseVolume", 0))
+        pnl       = float(o.get("totalProfits", 0))
+        ts        = o.get("cTime", "")
+        ts_fmt    = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)/1000)) if ts else ""
+        # Cek apakah sudah ada di db
+        exists = conn.execute("SELECT id FROM trades WHERE symbol=? AND opened_at=?", (symbol, ts_fmt)).fetchone()
+        if not exists:
+            if trade_side == "open":
+                action = "LONG" if side == "buy" else "SHORT"
+                conn.execute(
+                    "INSERT OR IGNORE INTO trades (symbol, action, entry_price, size, opened_at) VALUES (?,?,?,?,?)",
+                    (symbol, action, price, size, ts_fmt)
+                )
+            elif trade_side == "close":
+                conn.execute(
+                    "UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
+                    (price, pnl, ts_fmt, symbol)
+                )
     conn.commit()
     conn.close()
 
@@ -215,10 +253,10 @@ Use this history to make a better decision. Avoid pairs that consistently lose.
 """
     prompt = f"""You are a crypto futures trader analyzing cheap coins (price < $1).
 {history_ctx}
-Pick the single BEST trade opportunity from this market data:
+Pick the 2 BEST trade opportunities from this market data. They must be different pairs.
 {json.dumps(all_data, indent=2)}
-Reply ONLY valid JSON:
-{{"action":"LONG or SHORT","pair":"SYMBOL","confidence":1-10,"reason":"brief"}}"""
+Reply ONLY valid JSON array with exactly 2 items:
+[{{"action":"LONG or SHORT","pair":"SYMBOL","confidence":1-10,"reason":"brief"}},{{"action":"LONG or SHORT","pair":"SYMBOL","confidence":1-10,"reason":"brief"}}]"""
     r = requests.post(
         f"{BLUEMIND_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {BLUEMIND_API_KEY}", "Content-Type": "application/json"},
@@ -304,7 +342,8 @@ def calculate_size_and_leverage(price, symbol):
     inst       = get_instrument(symbol)
     min_qty    = float(inst.get("minTradeNum", 1))
     multiplier = float(inst.get("sizeMultiplier", 1))
-    max_lev    = int(inst.get("maxLever", 20))
+    max_lev    = min(50, int(inst.get("maxLever", 50)))
+    max_lev    = max(10, max_lev)
     leverage   = max_lev
     size_raw   = MIN_NOTIONAL / price
     size       = math.ceil(size_raw / multiplier) * multiplier
@@ -395,12 +434,17 @@ def handle_commands():
             elif text == "/stop":
                 send_telegram("🛑 Bot dihentikan.")
                 bot_running = False
+            elif text == "/trade":
+                global force_trade
+                force_trade = True
+                send_telegram("⚡ Memulai pencarian pair sekarang...")
             elif text == "/help":
                 send_telegram(
                     "📋 <b>Commands:</b>\n"
                     "/status — posisi aktif + PnL\n"
                     "/balance — cek balance\n"
                     "/history — trade history + win rate\n"
+                    "/trade — cari dan buka posisi sekarang\n"
                     "/close — close semua posisi\n"
                     "/close SYMBOL — close posisi tertentu\n"
                     "/stop — stop bot"
@@ -419,6 +463,7 @@ def run():
 
     while bot_running:
         try:
+            sync_closed_trades()
             balance   = get_balance()
             logger.info(f"Balance: {balance} USDT")
             tickers   = get_all_tickers()
@@ -469,43 +514,57 @@ def run():
                     all_data.append(d)
             logger.info(f"Got data for {len(all_data)} pairs")
 
-            decision   = ask_llm_open(all_data, summary)
-            logger.info(f"LLM open: {json.dumps(decision, indent=2)}")
+            decisions = ask_llm_open(all_data, summary)
+            if isinstance(decisions, dict):
+                decisions = [decisions]
+            logger.info(f"LLM open: {json.dumps(decisions, indent=2)}")
 
-            action     = decision.get("action", "").upper()
-            symbol     = decision.get("pair", "")
-            confidence = int(decision.get("confidence", 0))
+            opened = 0
+            active_syms = [p["symbol"] for p in get_positions()]
+            for decision in decisions[:2]:
+                action     = decision.get("action", "").upper()
+                symbol     = decision.get("pair", "")
+                confidence = int(decision.get("confidence", 0))
 
-            if action not in ("LONG", "SHORT") or not symbol or confidence < 6:
-                logger.info("Skipping low confidence")
-                time.sleep(SLEEP_MINUTES * 60)
-                continue
+                if action not in ("LONG", "SHORT") or not symbol or confidence < 6:
+                    logger.info(f"Skipping {symbol} low confidence")
+                    continue
 
-            price = next((d["price"] for d in all_data if d["symbol"] == symbol), None)
-            if not price:
-                time.sleep(SLEEP_MINUTES * 60)
-                continue
+                if symbol in active_syms:
+                    logger.info(f"Skipping {symbol} already have position")
+                    continue
 
-            size, leverage = calculate_size_and_leverage(price, symbol)
-            side     = "buy"  if action == "LONG" else "sell"
-            pos_side = "long" if action == "LONG" else "short"
+                price = next((d["price"] for d in all_data if d["symbol"] == symbol), None)
+                if not price:
+                    continue
 
-            set_leverage(symbol, leverage)
-            res = place_order(symbol, side, "open", size, pos_side)
-            if res.get("code") == "00000":
-                save_trade_open(symbol, action, price, size)
-                logger.info(f"✅ {action} {size} {symbol} @ {leverage}x")
-                send_telegram(f"🟢 <b>{action}</b> {symbol}\nSize: {size} @ {leverage}x\nReason: {decision.get('reason')}")
-            else:
-                logger.error(f"Order failed: {res}")
-                send_telegram(f"⚠️ Order gagal {symbol}: {res.get('msg')}")
+                size, leverage = calculate_size_and_leverage(price, symbol)
+                side     = "buy"  if action == "LONG" else "sell"
+                pos_side = "long" if action == "LONG" else "short"
+
+                set_leverage(symbol, leverage)
+                res = place_order(symbol, side, "open", size, pos_side)
+                if res.get("code") == "00000":
+                    save_trade_open(symbol, action, price, size)
+                    logger.info(f"✅ {action} {size} {symbol} @ {leverage}x")
+                    send_telegram(f"🟢 <b>{action}</b> {symbol}\nSize: {size} @ {leverage}x\nReason: {decision.get('reason')}")
+                    opened += 1
+                else:
+                    logger.error(f"Order failed {symbol}: {res}")
+                    send_telegram(f"⚠️ Order gagal {symbol}: {res.get('msg')}")
 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
             send_telegram(f"⚠️ Bot error: {e}")
 
         logger.info(f"Sleeping {SLEEP_MINUTES} min...")
-        time.sleep(SLEEP_MINUTES * 60)
+        elapsed = 0
+        while elapsed < SLEEP_MINUTES * 60 and not force_trade:
+            time.sleep(5)
+            elapsed += 5
+        if force_trade:
+            force_trade = False
+            logger.info("Force trade triggered via Telegram")
 
     logger.info("Bot stopped.")
 
