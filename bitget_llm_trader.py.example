@@ -17,17 +17,20 @@ TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
 MIN_NOTIONAL  = 5.5
 MAX_PRICE     = 1.0
+MIN_LEVERAGE  = 10
+MAX_LEVERAGE  = 50
 MARGIN_MODE   = "isolated"
 PRODUCT_TYPE  = "USDT-FUTURES"
 MARGIN_COIN   = "USDT"
-SLEEP_MINUTES = 5
+SLEEP_MINUTES = 15
+TP_USD        = 1.0
+MIN_LOSS_TO_CLOSE = -0.05  # Jangan close kalau loss < $0.05
 DB_PATH       = "/root/trade_history.db"
 
 bot_running    = True
-last_update_id = 0
 force_trade    = False
+last_update_id = 0
 
-# ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS trades (
@@ -58,41 +61,41 @@ def save_trade_close(symbol, exit_price, pnl):
     conn.close()
 
 def sync_closed_trades():
-    """Sync trade history dari Bitget ke database lokal"""
-    conn = sqlite3.connect(DB_PATH)
-    res = api_get(f"/api/v2/mix/order/orders-history?productType={PRODUCT_TYPE}&limit=20")
-    if res.get("code") != "00000":
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        res = api_get(f"/api/v2/mix/order/orders-history?productType={PRODUCT_TYPE}&limit=20")
+        if res.get("code") != "00000":
+            conn.close()
+            return
+        orders = res.get("data", {}).get("entrustedList", [])
+        for o in orders:
+            if o.get("state") != "filled":
+                continue
+            symbol     = o.get("symbol")
+            side       = o.get("side")
+            trade_side = o.get("tradeSide", "")
+            price      = float(o.get("priceAvg", 0))
+            size       = float(o.get("baseVolume", 0))
+            pnl        = float(o.get("totalProfits", 0))
+            ts         = o.get("cTime", "")
+            ts_fmt     = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)/1000)) if ts else ""
+            exists     = conn.execute("SELECT id FROM trades WHERE symbol=? AND opened_at=?", (symbol, ts_fmt)).fetchone()
+            if not exists:
+                if trade_side == "open":
+                    action = "LONG" if side == "buy" else "SHORT"
+                    conn.execute(
+                        "INSERT OR IGNORE INTO trades (symbol, action, entry_price, size, opened_at) VALUES (?,?,?,?,?)",
+                        (symbol, action, price, size, ts_fmt)
+                    )
+                elif trade_side == "close":
+                    conn.execute(
+                        "UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
+                        (price, pnl, ts_fmt, symbol)
+                    )
+        conn.commit()
         conn.close()
-        return
-    orders = res.get("data", {}).get("entrustedList", [])
-    for o in orders:
-        if o.get("state") != "filled":
-            continue
-        order_id  = o.get("orderId")
-        symbol    = o.get("symbol")
-        side      = o.get("side")
-        trade_side = o.get("tradeSide", "")
-        price     = float(o.get("priceAvg", 0))
-        size      = float(o.get("baseVolume", 0))
-        pnl       = float(o.get("totalProfits", 0))
-        ts        = o.get("cTime", "")
-        ts_fmt    = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)/1000)) if ts else ""
-        # Cek apakah sudah ada di db
-        exists = conn.execute("SELECT id FROM trades WHERE symbol=? AND opened_at=?", (symbol, ts_fmt)).fetchone()
-        if not exists:
-            if trade_side == "open":
-                action = "LONG" if side == "buy" else "SHORT"
-                conn.execute(
-                    "INSERT OR IGNORE INTO trades (symbol, action, entry_price, size, opened_at) VALUES (?,?,?,?,?)",
-                    (symbol, action, price, size, ts_fmt)
-                )
-            elif trade_side == "close":
-                conn.execute(
-                    "UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
-                    (price, pnl, ts_fmt, symbol)
-                )
-    conn.commit()
-    conn.close()
+    except Exception as e:
+        logger.warning(f"Sync error: {e}")
 
 def get_trade_summary():
     conn = sqlite3.connect(DB_PATH)
@@ -102,20 +105,18 @@ def get_trade_summary():
     conn.close()
     if not trades:
         return None
-    total   = len(trades)
-    wins    = [t for t in trades if t[2] > 0]
-    losses  = [t for t in trades if t[2] <= 0]
+    total    = len(trades)
+    wins     = [t for t in trades if t[2] > 0]
     win_rate = round(len(wins) / total * 100, 1)
     avg_pnl  = round(sum(t[2] for t in trades) / total, 4)
-    # Best/worst pair
     from collections import defaultdict
     pair_pnl = defaultdict(list)
     for t in trades:
         pair_pnl[t[0]].append(t[2])
     pair_avg = {k: sum(v)/len(v) for k, v in pair_pnl.items()}
-    best  = max(pair_avg, key=pair_avg.get)
-    worst = min(pair_avg, key=pair_avg.get)
-    history = "\n".join([f"- {t[0]} {t[1]}: {'+'if t[2]>0 else ''}{t[2]:.4f} USDT" for t in trades[:10]])
+    best     = max(pair_avg, key=pair_avg.get)
+    worst    = min(pair_avg, key=pair_avg.get)
+    history  = "\n".join([f"- {t[0]} {t[1]}: {'+'if t[2]>0 else ''}{t[2]:.4f} USDT" for t in trades[:10]])
     return {
         "total_trades": total,
         "win_rate": f"{win_rate}%",
@@ -125,7 +126,6 @@ def get_trade_summary():
         "last_10": history,
     }
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(msg):
     try:
         requests.post(
@@ -151,7 +151,6 @@ def get_telegram_updates():
     except:
         return []
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
 def sign(method, path, body=""):
     ts  = str(int(time.time() * 1000))
     msg = ts + method.upper() + path + (body if body else "")
@@ -176,7 +175,6 @@ def api_post(path, body):
     r = requests.post(BASE_URL + path, headers=sign("POST", path, s), data=s, timeout=10)
     return r.json()
 
-# ── Account ───────────────────────────────────────────────────────────────────
 def get_balance():
     res = api_get(f"/api/v2/mix/account/accounts?productType={PRODUCT_TYPE}")
     if res.get("code") == "00000":
@@ -185,7 +183,6 @@ def get_balance():
                 return float(a["available"])
     return 0.0
 
-# ── Market ────────────────────────────────────────────────────────────────────
 def get_all_tickers():
     res = api_get(f"/api/v2/mix/market/tickers?productType={PRODUCT_TYPE}")
     if res.get("code") == "00000":
@@ -240,7 +237,26 @@ def get_market_data(symbol, ticker):
         "rsi":         round(rsi, 2),
     }
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
+def call_llm(prompt):
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{BLUEMIND_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {BLUEMIND_API_KEY}", "Content-Type": "application/json"},
+                json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+                timeout=60,
+            )
+            text = r.json()["choices"][0]["message"]["content"].strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text.strip())
+        except Exception as e:
+            logger.warning(f"LLM attempt {attempt+1} failed: {e}")
+            time.sleep(5)
+    return None
+
 def ask_llm_open(all_data, summary):
     history_ctx = ""
     if summary:
@@ -249,7 +265,7 @@ Your trading history (last 20 trades):
 {summary['last_10']}
 Win rate: {summary['win_rate']} | Avg PnL: {summary['avg_pnl']} USDT
 Best pair: {summary['best_pair']} | Worst pair: {summary['worst_pair']}
-Use this history to make a better decision. Avoid pairs that consistently lose.
+Avoid pairs that consistently lose.
 """
     prompt = f"""You are a crypto futures trader analyzing cheap coins (price < $1).
 {history_ctx}
@@ -257,18 +273,10 @@ Pick the 2 BEST trade opportunities from this market data. They must be differen
 {json.dumps(all_data, indent=2)}
 Reply ONLY valid JSON array with exactly 2 items:
 [{{"action":"LONG or SHORT","pair":"SYMBOL","confidence":1-10,"reason":"brief"}},{{"action":"LONG or SHORT","pair":"SYMBOL","confidence":1-10,"reason":"brief"}}]"""
-    r = requests.post(
-        f"{BLUEMIND_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {BLUEMIND_API_KEY}", "Content-Type": "application/json"},
-        json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-        timeout=60,
-    )
-    text = r.json()["choices"][0]["message"]["content"].strip()
-    if "```" in text:
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
+    result = call_llm(prompt)
+    if isinstance(result, dict):
+        result = [result]
+    return result
 
 def ask_llm_monitor(position, market_data):
     sym   = position["symbol"]
@@ -280,43 +288,20 @@ Position: {hold.upper()} {sym}
 Entry price: {entry}
 Unrealized PnL: {pnl} USDT
 Current market data: {json.dumps(market_data, indent=2)}
-Should we CLOSE this position now or HOLD?
+
+IMPORTANT: Only recommend CLOSE if there is a strong reason. Do NOT close just because PnL is slightly negative.
+Close only if: PnL is very negative (< -0.1 USDT) OR market shows strong reversal signals.
+Otherwise HOLD and let the position develop.
+
 Reply ONLY valid JSON:
 {{"decision":"CLOSE or HOLD","reason":"brief"}}"""
-    r = requests.post(
-        f"{BLUEMIND_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {BLUEMIND_API_KEY}", "Content-Type": "application/json"},
-        json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-        timeout=60,
-    )
-    text = r.json()["choices"][0]["message"]["content"].strip()
-    if "```" in text:
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
+    return call_llm(prompt)
 
-# ── Trade ─────────────────────────────────────────────────────────────────────
 def get_positions():
     res = api_get(f"/api/v2/mix/position/all-position?productType={PRODUCT_TYPE}&marginCoin={MARGIN_COIN}")
     if res.get("code") == "00000":
         return [p for p in res["data"] if float(p.get("total", 0)) > 0]
     return []
-
-def place_order(symbol, side, trade_side, size, pos_side, margin_mode=None):
-    body = {
-        "symbol":      symbol,
-        "productType": PRODUCT_TYPE,
-        "marginMode":  margin_mode if margin_mode else MARGIN_MODE,
-        "marginCoin":  MARGIN_COIN,
-        "size":        str(size),
-        "side":        side,
-        "tradeSide":   trade_side,
-        "orderType":   "market",
-        "force":       "gtc",
-        "posSide":     pos_side,
-    }
-    return api_post("/api/v2/mix/order/place-order", body)
 
 def close_position_api(symbol, hold_side):
     body = {
@@ -326,6 +311,21 @@ def close_position_api(symbol, hold_side):
         "holdSide":    hold_side,
     }
     return api_post("/api/v2/mix/order/close-positions", body)
+
+def place_order(symbol, side, trade_side, size, pos_side):
+    body = {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginMode":  MARGIN_MODE,
+        "marginCoin":  MARGIN_COIN,
+        "size":        str(size),
+        "side":        side,
+        "tradeSide":   trade_side,
+        "orderType":   "market",
+        "force":       "gtc",
+        "posSide":     pos_side,
+    }
+    return api_post("/api/v2/mix/order/place-order", body)
 
 def set_leverage(symbol, leverage):
     body = {
@@ -342,9 +342,8 @@ def calculate_size_and_leverage(price, symbol):
     inst       = get_instrument(symbol)
     min_qty    = float(inst.get("minTradeNum", 1))
     multiplier = float(inst.get("sizeMultiplier", 1))
-    max_lev    = min(50, int(inst.get("maxLever", 50)))
-    max_lev    = max(10, max_lev)
-    leverage   = max_lev
+    max_lev    = int(inst.get("maxLever", MAX_LEVERAGE))
+    leverage   = max(MIN_LEVERAGE, min(MAX_LEVERAGE, max_lev))
     size_raw   = MIN_NOTIONAL / price
     size       = math.ceil(size_raw / multiplier) * multiplier
     size       = max(size, min_qty)
@@ -358,20 +357,17 @@ def close_all_positions():
         send_telegram("ℹ️ Tidak ada posisi aktif.")
         return
     for pos in positions:
-        sym   = pos["symbol"]
-        total = float(pos["total"])
-        hold  = pos.get("holdSide", "long")
-        side  = "sell" if hold == "long" else "buy"
-        pnl   = float(pos.get("unrealizedPL", 0))
+        sym  = pos["symbol"]
+        hold = pos.get("holdSide", "long")
+        pnl  = float(pos.get("unrealizedPL", 0))
         price = float(pos.get("markPrice", 0))
-        res = close_position_api(sym, hold)
+        res  = close_position_api(sym, hold)
         if res.get("code") == "00000":
             save_trade_close(sym, price, pnl)
             send_telegram(f"🔴 <b>CLOSED</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>")
 
-# ── Telegram commands ─────────────────────────────────────────────────────────
 def handle_commands():
-    global bot_running
+    global bot_running, force_trade
     while bot_running:
         updates = get_telegram_updates()
         for u in updates:
@@ -408,6 +404,9 @@ def handle_commands():
                         f"Worst pair: <b>{summary['worst_pair']}</b>\n\n"
                         f"Last 10:\n{summary['last_10']}"
                     )
+            elif text == "/trade":
+                force_trade = True
+                send_telegram("⚡ Memulai pencarian pair sekarang...")
             elif text.startswith("/close"):
                 parts = text.split()
                 if len(parts) == 1:
@@ -420,12 +419,10 @@ def handle_commands():
                     if not pos:
                         send_telegram(f"⚠️ Tidak ada posisi {sym}")
                     else:
-                        total = float(pos["total"])
                         hold  = pos.get("holdSide", "long")
                         pnl   = float(pos.get("unrealizedPL", 0))
                         price = float(pos.get("markPrice", 0))
-                        side  = "sell" if hold == "long" else "buy"
-                        res = close_position_api(sym, hold)
+                        res   = close_position_api(sym, hold)
                         if res.get("code") == "00000":
                             save_trade_close(sym, price, pnl)
                             send_telegram(f"🔴 <b>CLOSED</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>")
@@ -434,10 +431,6 @@ def handle_commands():
             elif text == "/stop":
                 send_telegram("🛑 Bot dihentikan.")
                 bot_running = False
-            elif text == "/trade":
-                global force_trade
-                force_trade = True
-                send_telegram("⚡ Memulai pencarian pair sekarang...")
             elif text == "/help":
                 send_telegram(
                     "📋 <b>Commands:</b>\n"
@@ -451,9 +444,8 @@ def handle_commands():
                 )
         time.sleep(2)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def run():
-    global bot_running
+    global bot_running, force_trade
     init_db()
     logger.info("=== Bitget LLM Trading Bot Started ===")
     send_telegram("🤖 <b>Bitget LLM Bot Started</b>\nKetik /help untuk daftar perintah.")
@@ -478,13 +470,32 @@ def run():
                     total = float(pos.get("total", 0))
                     price = float(pos.get("markPrice", 0))
                     logger.info(f"Position: {hold.upper()} {sym} | PnL: {pnl:.4f} USDT")
-                    ticker   = tickers.get(sym, {})
-                    mdata    = get_market_data(sym, ticker) if ticker else None
+
+                    # Auto TP
+                    if pnl >= TP_USD:
+                        res = close_position_api(sym, hold)
+                        if res.get("code") == "00000":
+                            save_trade_close(sym, price, pnl)
+                            logger.info(f"TP hit! Closed {sym} PnL: {pnl:.4f}")
+                            send_telegram(f"🎯 <b>TAKE PROFIT</b> {hold.upper()} {sym}\nPnL: <b>+{pnl:.4f} USDT</b>")
+                        continue
+
+                    # Jangan minta LLM kalau loss masih kecil
+                    if pnl > MIN_LOSS_TO_CLOSE:
+                        logger.info(f"Holding {sym} - PnL {pnl:.4f} within threshold")
+                        continue
+
+                    # LLM monitor kalau loss sudah signifikan
+                    ticker = tickers.get(sym, {})
+                    mdata  = get_market_data(sym, ticker) if ticker else None
                     if not mdata:
                         continue
                     decision = ask_llm_monitor(pos, mdata)
+                    if not decision:
+                        logger.warning(f"LLM monitor failed for {sym}, holding")
+                        continue
                     logger.info(f"LLM monitor {sym}: {decision}")
-                    if pnl >= 1.0 or decision.get("decision") == "CLOSE":
+                    if decision.get("decision") == "CLOSE":
                         res = close_position_api(sym, hold)
                         if res.get("code") == "00000":
                             save_trade_close(sym, price, pnl)
@@ -494,8 +505,20 @@ def run():
                             logger.error(f"Close failed: {res}")
                     else:
                         logger.info(f"Holding {sym}: {decision.get('reason')}")
-                time.sleep(SLEEP_MINUTES * 60)
-                continue
+
+                # Kalau masih ada posisi aktif, skip open baru
+                positions = get_positions()
+                if len(positions) >= 2:
+                    logger.info("Max 2 positions reached, skipping new order")
+                    force_trade = False
+                    logger.info(f"Sleeping {SLEEP_MINUTES} min...")
+                    elapsed = 0
+                    while elapsed < SLEEP_MINUTES * 60 and not force_trade:
+                        time.sleep(5)
+                        elapsed += 5
+                    if force_trade:
+                        force_trade = False
+                    continue
 
             if balance < 0.1:
                 logger.warning("Balance too low")
@@ -515,12 +538,14 @@ def run():
             logger.info(f"Got data for {len(all_data)} pairs")
 
             decisions = ask_llm_open(all_data, summary)
-            if isinstance(decisions, dict):
-                decisions = [decisions]
-            logger.info(f"LLM open: {json.dumps(decisions, indent=2)}")
+            if not decisions:
+                logger.warning("LLM open failed, skipping")
+                time.sleep(SLEEP_MINUTES * 60)
+                continue
 
-            opened = 0
+            logger.info(f"LLM open: {json.dumps(decisions, indent=2)}")
             active_syms = [p["symbol"] for p in get_positions()]
+
             for decision in decisions[:2]:
                 action     = decision.get("action", "").upper()
                 symbol     = decision.get("pair", "")
@@ -529,7 +554,6 @@ def run():
                 if action not in ("LONG", "SHORT") or not symbol or confidence < 6:
                     logger.info(f"Skipping {symbol} low confidence")
                     continue
-
                 if symbol in active_syms:
                     logger.info(f"Skipping {symbol} already have position")
                     continue
@@ -548,15 +572,15 @@ def run():
                     save_trade_open(symbol, action, price, size)
                     logger.info(f"✅ {action} {size} {symbol} @ {leverage}x")
                     send_telegram(f"🟢 <b>{action}</b> {symbol}\nSize: {size} @ {leverage}x\nReason: {decision.get('reason')}")
-                    opened += 1
+                    active_syms.append(symbol)
                 else:
                     logger.error(f"Order failed {symbol}: {res}")
                     send_telegram(f"⚠️ Order gagal {symbol}: {res.get('msg')}")
 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
-            send_telegram(f"⚠️ Bot error: {e}")
 
+        force_trade = False
         logger.info(f"Sleeping {SLEEP_MINUTES} min...")
         elapsed = 0
         while elapsed < SLEEP_MINUTES * 60 and not force_trade:
@@ -564,7 +588,7 @@ def run():
             elapsed += 5
         if force_trade:
             force_trade = False
-            logger.info("Force trade triggered via Telegram")
+            logger.info("Force trade triggered")
 
     logger.info("Bot stopped.")
 
