@@ -10,7 +10,7 @@ BASE_URL   = "https://api.bitget.com"
 
 BLUEMIND_API_KEY  = "YOUR_BLUEMIND_API_KEY"
 BLUEMIND_BASE_URL = "https://api.bluesminds.com/v1"
-LLM_MODEL         = "meta/llama-3.1-8b-instruct"
+LLM_MODEL         = "mistralai/mistral-small-3.1-24b-instruct-2503"
 
 TELEGRAM_TOKEN   = "YOUR_TELEGRAM_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
@@ -223,7 +223,7 @@ Reply ONLY valid JSON:
         f"{BLUEMIND_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {BLUEMIND_API_KEY}", "Content-Type": "application/json"},
         json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-        timeout=30,
+        timeout=60,
     )
     text = r.json()["choices"][0]["message"]["content"].strip()
     if "```" in text:
@@ -249,7 +249,7 @@ Reply ONLY valid JSON:
         f"{BLUEMIND_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {BLUEMIND_API_KEY}", "Content-Type": "application/json"},
         json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-        timeout=30,
+        timeout=60,
     )
     text = r.json()["choices"][0]["message"]["content"].strip()
     if "```" in text:
