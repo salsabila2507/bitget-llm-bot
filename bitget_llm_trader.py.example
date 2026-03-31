@@ -265,11 +265,11 @@ def get_positions():
         return [p for p in res["data"] if float(p.get("total", 0)) > 0]
     return []
 
-def place_order(symbol, side, trade_side, size, pos_side):
+def place_order(symbol, side, trade_side, size, pos_side, margin_mode=None):
     body = {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
-        "marginMode":  MARGIN_MODE,
+        "marginMode":  margin_mode if margin_mode else MARGIN_MODE,
         "marginCoin":  MARGIN_COIN,
         "size":        str(size),
         "side":        side,
@@ -279,6 +279,15 @@ def place_order(symbol, side, trade_side, size, pos_side):
         "posSide":     pos_side,
     }
     return api_post("/api/v2/mix/order/place-order", body)
+
+def close_position_api(symbol, hold_side):
+    body = {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+        "holdSide":    hold_side,
+    }
+    return api_post("/api/v2/mix/order/close-positions", body)
 
 def set_leverage(symbol, leverage):
     body = {
@@ -316,7 +325,7 @@ def close_all_positions():
         side  = "sell" if hold == "long" else "buy"
         pnl   = float(pos.get("unrealizedPL", 0))
         price = float(pos.get("markPrice", 0))
-        res   = place_order(sym, side, "close", total, hold)
+        res = close_position_api(sym, hold)
         if res.get("code") == "00000":
             save_trade_close(sym, price, pnl)
             send_telegram(f"🔴 <b>CLOSED</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>")
@@ -360,9 +369,29 @@ def handle_commands():
                         f"Worst pair: <b>{summary['worst_pair']}</b>\n\n"
                         f"Last 10:\n{summary['last_10']}"
                     )
-            elif text == "/close":
-                send_telegram("⏳ Menutup semua posisi...")
-                close_all_positions()
+            elif text.startswith("/close"):
+                parts = text.split()
+                if len(parts) == 1:
+                    send_telegram("⏳ Menutup semua posisi...")
+                    close_all_positions()
+                else:
+                    sym = parts[1].upper()
+                    positions = get_positions()
+                    pos = next((p for p in positions if p["symbol"].upper() == sym.upper()), None)
+                    if not pos:
+                        send_telegram(f"⚠️ Tidak ada posisi {sym}")
+                    else:
+                        total = float(pos["total"])
+                        hold  = pos.get("holdSide", "long")
+                        pnl   = float(pos.get("unrealizedPL", 0))
+                        price = float(pos.get("markPrice", 0))
+                        side  = "sell" if hold == "long" else "buy"
+                        res = close_position_api(sym, hold)
+                        if res.get("code") == "00000":
+                            save_trade_close(sym, price, pnl)
+                            send_telegram(f"🔴 <b>CLOSED</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>")
+                        else:
+                            send_telegram(f"⚠️ Gagal close {sym}: {res.get('msg')}")
             elif text == "/stop":
                 send_telegram("🛑 Bot dihentikan.")
                 bot_running = False
@@ -373,6 +402,7 @@ def handle_commands():
                     "/balance — cek balance\n"
                     "/history — trade history + win rate\n"
                     "/close — close semua posisi\n"
+                    "/close SYMBOL — close posisi tertentu\n"
                     "/stop — stop bot"
                 )
         time.sleep(2)
@@ -410,8 +440,7 @@ def run():
                     decision = ask_llm_monitor(pos, mdata)
                     logger.info(f"LLM monitor {sym}: {decision}")
                     if pnl >= 1.0 or decision.get("decision") == "CLOSE":
-                        close_side = "sell" if hold == "long" else "buy"
-                        res = place_order(sym, close_side, "close", total, hold)
+                        res = close_position_api(sym, hold)
                         if res.get("code") == "00000":
                             save_trade_close(sym, price, pnl)
                             logger.info(f"Closed {sym} PnL: {pnl:.4f}")
