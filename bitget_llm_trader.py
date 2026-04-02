@@ -6,15 +6,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
     handlers=[logging.FileHandler('/root/bitget_bot.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
-API_KEY = "YOUR_BITGET_API_KEY"
-SECRET_KEY = "YOUR_BITGET_SECRET_KEY"
-PASSPHRASE = "YOUR_BITGET_PASSPHRASE"
+API_KEY = ""
+SECRET_KEY = ""
+PASSPHRASE = ""
 BASE_URL = "https://api.bitget.com"
-GROQ_API_KEY = "YOUR_GROQ_API_KEY"
+GROQ_API_KEY = ""
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 LLM_MODEL = "llama-3.3-70b-versatile"
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+TELEGRAM_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
 
 MIN_NOTIONAL, MAX_PRICE = 5.5, 1.0
 MIN_LEVERAGE, MAX_LEVERAGE = 10, 30
