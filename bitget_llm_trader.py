@@ -1,37 +1,102 @@
-import time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3
+import os, sys, subprocess, time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3
 from datetime import datetime
 from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('/root/bitget_bot.log'), logging.StreamHandler()])
+    handlers=[logging.FileHandler('/root/bitget-llm-bot/bitget_bot.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
 API_KEY = ""
 SECRET_KEY = ""
 PASSPHRASE = ""
 BASE_URL = "https://api.bitget.com"
-GROQ_API_KEY = ""
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-LLM_MODEL = "llama-3.3-70b-versatile"
+NVIDIA_API_KEY = ""
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+LLM_MODEL = "meta/llama-3.3-70b-instruct"
 TELEGRAM_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
+TELEGRAM_CHAT_IDS = set()
+DRY_RUN = True
+DRY_RUN_BALANCE = 5.0
+DRY_RUN_POLL_SECONDS = 15
+TRADE_MODE = "scalping"
+TAKER_FEE_RATE = 0.0006
+DAILY_NET_PROFIT_TARGET_USD = 0.05
 
-MIN_NOTIONAL, MAX_PRICE = 5.5, 1.0
-MIN_LEVERAGE, MAX_LEVERAGE = 10, 30
+MIN_NOTIONAL = 5.5
+MIN_LEVERAGE, MAX_LEVERAGE = 1, 125
+RISK_MAX_LEVERAGE = 8
+LOW_CONFIDENCE_MAX_LEVERAGE = 5
+MID_CONFIDENCE_MAX_LEVERAGE = 7
+MAX_MARGIN_PER_TRADE_FRACTION = 0.45
+MIN_FREE_BALANCE_USDT = 0.20
+MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
-SLEEP_MINUTES = 15
+SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
 
-MAX_POSITIONS, MAX_NOTIONAL_PCT = 2, 40.0
-STOP_LOSS_PCT, TAKE_PROFIT_USD = 10.0, 0.50
+MAX_POSITIONS, MAX_ORDERS_PER_CYCLE = 2, 2
+TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
 MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.30, 10
-TRAILING_STOP_PCT, MIN_CONFIDENCE = 3.0, 75
+TRAILING_STOP_PCT, MIN_CONFIDENCE = (1.5, 72) if TRADE_MODE == "scalping" else (3.0, 70)
 CONSECUTIVE_LOSS_LIMIT = 3
 TIMEFRAMES = ["15m", "1H", "4H"]
+SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
 DB_PATH = "/root/trade_history.db"
 
 bot_running, force_trade, last_update_id = True, False, 0
 last_trade_time, daily_pnl = 0, 0.0
 trailing_stops, consecutive_losses, blacklisted_pairs = {}, 0, set()
+daily_profit_locked = False
+
+TRADE_PROFILES = {
+    "normal": {
+        "sleep_minutes": 60,
+        "take_profit_roi_pct": 70.0,
+        "stop_loss_roi_pct": 40.0,
+        "trailing_stop_pct": 3.0,
+        "min_confidence": 70,
+    },
+    "scalping": {
+        "sleep_minutes": 5,
+        "take_profit_roi_pct": 10.0,
+        "stop_loss_roi_pct": 6.0,
+        "trailing_stop_pct": 1.5,
+        "min_confidence": 72,
+    },
+}
+
+def apply_trade_mode(mode):
+    global TRADE_MODE, SLEEP_MINUTES, TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT, TRAILING_STOP_PCT, MIN_CONFIDENCE
+    mode = str(mode).strip().lower()
+    if mode not in TRADE_PROFILES:
+        return False
+    TRADE_MODE = mode
+    profile = TRADE_PROFILES[mode]
+    SLEEP_MINUTES = profile["sleep_minutes"]
+    TAKE_PROFIT_ROI_PCT = profile["take_profit_roi_pct"]
+    STOP_LOSS_ROI_PCT = profile["stop_loss_roi_pct"]
+    TRAILING_STOP_PCT = profile["trailing_stop_pct"]
+    MIN_CONFIDENCE = profile["min_confidence"]
+    return True
+
+apply_trade_mode(TRADE_MODE)
+
+def ensure_daemonized():
+    if os.environ.get("BITGET_BOT_DAEMON") == "1":
+        return
+    env = os.environ.copy()
+    env["BITGET_BOT_DAEMON"] = "1"
+    script_path = os.path.abspath(__file__)
+    subprocess.Popen(
+        [sys.executable, "-u", script_path],
+        env=env,
+        cwd=os.path.dirname(script_path),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    sys.exit(0)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -55,6 +120,32 @@ def save_trade_close(symbol, exit_price, pnl):
         (exit_price, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol))
     conn.commit()
     conn.close()
+
+def save_trade_close_by_id(trade_id, exit_price, pnl):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE id=?",
+        (exit_price, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), trade_id))
+    conn.commit()
+    conn.close()
+
+def get_dry_run_positions():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence
+            FROM trades WHERE closed_at IS NULL AND action IN ('DRY_LONG', 'DRY_SHORT')""")
+        rows = cur.fetchall()
+        conn.close()
+        return [{"id": r[0], "symbol": r[1], "action": r[2], "openPriceAvg": r[3],
+                 "size": r[4], "leverage": r[5], "confidence": r[6],
+                 "holdSide": "long" if r[2] == "DRY_LONG" else "short"} for r in rows]
+    except:
+        return []
+
+def get_strategy_positions():
+    return get_dry_run_positions() if DRY_RUN else get_positions()
+
+def get_strategy_balance():
+    return DRY_RUN_BALANCE if DRY_RUN else get_balance()
 
 def get_trade_summary():
     try:
@@ -86,6 +177,38 @@ def get_today_pnl():
         return result if result else 0.0
     except: return 0.0
 
+def get_open_dry_run_net_pnl():
+    if not DRY_RUN:
+        return 0.0
+    try:
+        tickers = {t.get("symbol"): t for t in get_tickers()}
+        total = 0.0
+        for p in get_dry_run_positions():
+            entry = float(p.get("openPriceAvg", 0))
+            ticker = tickers.get(p["symbol"], {})
+            current = parse_float(ticker.get("lastPr"), entry)
+            net_pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+            total += net_pnl
+        return total
+    except:
+        return 0.0
+
+def get_strategy_today_net_pnl():
+    pnl = get_today_pnl()
+    if DRY_RUN:
+        pnl += get_open_dry_run_net_pnl()
+    return pnl
+
+def estimate_round_trip_fee(entry_price, exit_price, size):
+    entry_notional = abs(entry_price * size)
+    exit_notional = abs(exit_price * size)
+    return (entry_notional + exit_notional) * TAKER_FEE_RATE
+
+def calculate_net_pnl(entry_price, exit_price, size, hold_side):
+    gross = (exit_price - entry_price) * size if hold_side == "long" else (entry_price - exit_price) * size
+    fee = estimate_round_trip_fee(entry_price, exit_price, size)
+    return gross - fee, fee
+
 def get_pair_performance(symbol):
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -97,6 +220,33 @@ def get_pair_performance(symbol):
         win_rate = (wins / total_trades) * 100
         return {"total": total_trades, "win_rate": win_rate, "avg_pnl": avg_pnl}
     except: return None
+
+def get_direction_performance():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("SELECT action, pnl FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 100")
+        rows = cur.fetchall()
+        conn.close()
+        stats = {"LONG": {"total": 0, "wins": 0, "pnl": 0.0}, "SHORT": {"total": 0, "wins": 0, "pnl": 0.0}}
+        for action, pnl in rows:
+            direction = str(action).upper()
+            if direction.startswith("DRY_"):
+                direction = direction[4:]
+            if direction not in stats:
+                continue
+            pnl = parse_float(pnl, 0.0)
+            stats[direction]["total"] += 1
+            stats[direction]["pnl"] += pnl
+            if pnl > 0:
+                stats[direction]["wins"] += 1
+        for direction in stats:
+            total = stats[direction]["total"]
+            stats[direction]["win_rate"] = (stats[direction]["wins"] / total * 100) if total else 0.0
+            stats[direction]["avg_pnl"] = (stats[direction]["pnl"] / total) if total else 0.0
+        return stats
+    except:
+        return {"LONG": {"total": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0},
+                "SHORT": {"total": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0}}
 
 def get_learning_context():
     try:
@@ -118,6 +268,11 @@ def get_learning_context():
         if winning_pairs:
             best = sorted(winning_pairs.items(), key=lambda x: x[1], reverse=True)[:3]
             context += f"Pairs with most wins: {', '.join([f'{p[0]} ({p[1]}x)' for p in best])}\n"
+        direction_stats = get_direction_performance()
+        context += "\nDirectional performance:\n"
+        for direction in ("LONG", "SHORT"):
+            d = direction_stats[direction]
+            context += f"- {direction}: Win rate {d['win_rate']:.1f}% | Avg PnL: {d['avg_pnl']:.4f} USDT | Trades: {d['total']}\n"
         context += f"\nLast 5 trades:\n"
         for row in rows[:5]:
             symbol, action, pnl, conf = row
@@ -168,11 +323,31 @@ def api_post(path, body):
 
 def get_balance():
     res = api_get(f"/api/v2/mix/account/accounts?productType={PRODUCT_TYPE}")
-    if res.get("code") != "00000": return 0.0
+    if res.get("code") != "00000":
+        logger.error(f"Bitget balance API response: {json.dumps(res, ensure_ascii=False)}")
+        return 0.0
     accs = res.get("data", [])
+    if isinstance(accs, dict):
+        accs = [accs]
     for a in accs:
-        if a.get("marginCoin") == MARGIN_COIN:
-            return float(a.get("available", 0))
+        if not isinstance(a, dict):
+            continue
+        if str(a.get("marginCoin", "")).upper() != MARGIN_COIN:
+            continue
+        for key in ("available", "isolatedMaxAvailable", "crossedMaxAvailable", "maxTransferOut", "usdtEquity", "accountEquity", "unionAvailable"):
+            balance = parse_float(a.get(key), 0.0)
+            if balance > 0:
+                return balance
+        for asset in a.get("assetList", []):
+            if not isinstance(asset, dict):
+                continue
+            if str(asset.get("coin", "")).upper() != MARGIN_COIN:
+                continue
+            for key in ("available", "balance"):
+                balance = parse_float(asset.get(key), 0.0)
+                if balance > 0:
+                    return balance
+    logger.error(f"Bitget balance API response: {json.dumps(res, ensure_ascii=False)}")
     return 0.0
 
 def get_positions():
@@ -195,9 +370,13 @@ def set_leverage(symbol, leverage, hold_side="long"):
     body = {"symbol": symbol, "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN, "leverage": str(leverage), "holdSide": hold_side}
     return api_post("/api/v2/mix/account/set-leverage", body)
 
-def place_order(symbol, side, size, hold_side="long"):
+def place_order(symbol, side, size, hold_side="long", tp_price=None, sl_price=None):
     body = {"symbol": symbol, "productType": PRODUCT_TYPE, "marginMode": MARGIN_MODE, "marginCoin": MARGIN_COIN,
             "size": str(size), "side": side, "tradeSide": "open", "orderType": "market", "holdSide": hold_side}
+    if tp_price:
+        body["presetStopSurplusPrice"] = str(tp_price)
+    if sl_price:
+        body["presetStopLossPrice"] = str(sl_price)
     return api_post("/api/v2/mix/order/place-order", body)
 
 def close_position_api(symbol, hold_side="long"):
@@ -205,21 +384,28 @@ def close_position_api(symbol, hold_side="long"):
     return api_post("/api/v2/mix/order/close-positions", body)
 
 def close_all_positions():
-    positions = get_positions()
+    positions = get_strategy_positions() if DRY_RUN else get_positions()
     for p in positions:
-        symbol, hold, pnl, price = p["symbol"], p.get("holdSide", "long"), float(p.get("unrealizedPL", 0)), float(p.get("markPrice", 0))
-        res = close_position_api(symbol, hold)
+        symbol, hold = p["symbol"], p.get("holdSide", "long")
+        price = float(p.get("markPrice", p.get("openPriceAvg", 0)))
+        pnl, fee, size, current, entry = estimate_position_net_pnl(p, price)
+        if DRY_RUN:
+            res = {"code": "00000"}
+        else:
+            res = close_position_api(symbol, hold)
         if res.get("code") == "00000":
-            save_trade_close(symbol, price, pnl)
+            save_trade_close_by_id(p["id"], price, pnl) if DRY_RUN else save_trade_close(symbol, price, pnl)
             emoji = "✅" if pnl > 0 else "❌"
-            send_telegram(f"{emoji} <b>CLOSED</b> {hold.upper()} {symbol}\nPnL: <b>{pnl:.4f} USDT</b>")
-            logger.info(f"Closed {hold} {symbol} | PnL: {pnl:.4f}")
+            prefix = "DRY RUN " if DRY_RUN else ""
+            send_telegram(f"{emoji} <b>{prefix}CLOSED</b> {hold.upper()} {symbol}\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+            logger.info(f"{prefix}Closed {hold} {symbol} | Net PnL: {pnl:.4f} | Fee: {fee:.4f}")
 
 def send_telegram(msg):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
-    except: pass
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=10)
+        except: pass
 
 def get_telegram_updates():
     global last_update_id
@@ -233,13 +419,184 @@ def get_telegram_updates():
 
 def ask_llm(prompt):
     try:
-        r = requests.post(f"{GROQ_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 600}, timeout=30)
-        return r.json()["choices"][0]["message"]["content"].strip()
+        r = requests.post(f"{NVIDIA_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
+            json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=30)
+        try:
+            data = r.json()
+        except Exception:
+            logger.error(f"LLM error: HTTP {r.status_code} body: {r.text}")
+            return None
+        if "choices" not in data:
+            logger.error(f"LLM error: HTTP {r.status_code} body: {r.text}")
+            return None
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.error(f"LLM error: {e}")
         return None
+
+def parse_float(value, default=0.0):
+    try:
+        cleaned = str(value).replace("$", "").replace(",", "").replace("%", "").replace("x", "").replace("X", "")
+        cleaned = cleaned.replace("USDT", "").replace("usdt", "").strip()
+        return float(cleaned)
+    except:
+        return default
+
+def parse_int(value, default=0):
+    try:
+        return int(float(str(value).replace("x", "").replace("X", "").strip()))
+    except:
+        return default
+
+def parse_bool(value):
+    if isinstance(value, bool): return value
+    return str(value).strip().lower() in ["true", "yes", "1", "open"]
+
+def analyze_top_signals(tickers, balance):
+    market_rows = []
+    ticker_map = {}
+    for t in tickers[:SIGNAL_SCAN_COUNT]:
+        symbol = t.get("symbol")
+        price = parse_float(t.get("lastPr"))
+        volume = parse_float(t.get("baseVolume"))
+        if not symbol or price <= 0: continue
+        ticker_map[symbol] = t
+        market_rows.append(f"{symbol} | price={price} | volume={volume}")
+    if not market_rows: return []
+    style_hint = "scalping" if TRADE_MODE == "scalping" else "normal trading"
+    learning_context = get_learning_context()
+    prompt = f"""You are controlling a Bitget USDT futures bot with about ${balance:.4f} available balance.
+
+Rank these {len(market_rows)} tickers and select the best {TOP_SIGNAL_COUNT} signals.
+From those {TOP_SIGNAL_COUNT}, choose which 1-2 are worth opening now.
+This bot is running in {style_hint} mode.
+
+=== LEARNING CONTEXT ===
+{learning_context}
+
+=== TICKERS ===
+{chr(10).join(market_rows)}
+
+Rules:
+1. Return exactly {TOP_SIGNAL_COUNT} ranked signals.
+2. Confidence must be 0-100.
+3. OPEN can only be YES when confidence is at least {MIN_CONFIDENCE}.
+4. You decide pair, LONG/SHORT, leverage, margin USDT, position size in base coin, and if the pair is possible with ${balance:.4f}.
+5. Use the lowest leverage that can meet Bitget minimum notional about {MIN_NOTIONAL} USDT. Avoid high leverage; unsafe setups above {RISK_MAX_LEVERAGE}x will be rejected.
+6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
+7. Use the learning context to compare LONG and SHORT performance separately. Do not default to LONG; choose SHORT when market momentum and history support it.
+8. If one direction has weak win rate or negative average net PnL, require stronger evidence before opening that direction.
+9. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs.
+
+Respond ONLY valid JSON:
+[
+  {{"rank":1,"symbol":"BTCUSDT","direction":"LONG","confidence":80,"leverage":50,"margin_usdt":0.15,"size":0.001,"possible":true,"open":true,"reason":"brief"}},
+  ...
+]
+"""
+    response = ask_llm(prompt)
+    if not response: return []
+    try:
+        start, end = response.find("["), response.rfind("]")
+        if start == -1 or end == -1: return []
+        raw_signals = json.loads(response[start:end + 1])
+        signals = []
+        for item in raw_signals:
+            symbol = str(item.get("symbol", "")).upper()
+            direction = str(item.get("direction", "")).upper()
+            if symbol not in ticker_map or direction not in ["LONG", "SHORT"]: continue
+            leverage = max(MIN_LEVERAGE, min(MAX_LEVERAGE, parse_int(item.get("leverage"), MIN_LEVERAGE)))
+            signal = {
+                "rank": parse_int(item.get("rank"), len(signals) + 1),
+                "symbol": symbol,
+                "direction": direction,
+                "confidence": parse_int(item.get("confidence"), 0),
+                "leverage": leverage,
+                "margin_usdt": parse_float(item.get("margin_usdt"), 0.0),
+                "size": parse_float(item.get("size"), 0.0),
+                "possible": parse_bool(item.get("possible", False)),
+                "open": parse_bool(item.get("open", False)),
+                "reason": str(item.get("reason", ""))[:220],
+                "price": parse_float(ticker_map[symbol].get("lastPr")),
+            }
+            signals.append(signal)
+            if len(signals) >= TOP_SIGNAL_COUNT: break
+        return signals
+    except Exception as e:
+        logger.error(f"Signal parse error: {e}")
+        return []
+
+def send_top_signals(signals, balance, open_count):
+    if not signals:
+        send_telegram("📊 <b>Top signals</b>\nNo valid signals returned this cycle.")
+        return
+    lines = [f"📊 <b>Top {len(signals)} signals</b>\nBalance: <b>{balance:.4f} USDT</b>\nOpen positions: <b>{open_count}/{MAX_POSITIONS}</b>"]
+    for s in signals:
+        possible = "OK" if s["possible"] else "NO"
+        open_mark = "OPEN" if s["open"] else "WATCH"
+        lines.append(
+            f"{s['rank']}. <b>{s['symbol']}</b> {s['direction']} | Conf: <b>{s['confidence']}%</b> | "
+            f"Lev: <b>{s['leverage']}x</b> | Margin: <b>{s['margin_usdt']:.4f}</b> | {possible}/{open_mark}\n"
+            f"{s['reason']}"
+        )
+    send_telegram("\n\n".join(lines))
+
+def normalize_order_size(size):
+    if size <= 0: return 0.0
+    if size >= 1:
+        return math.floor(size * 100) / 100
+    return math.floor(size * 100000000) / 100000000
+
+def risk_leverage_cap(confidence):
+    if confidence < 80:
+        return LOW_CONFIDENCE_MAX_LEVERAGE
+    if confidence < 90:
+        return MID_CONFIDENCE_MAX_LEVERAGE
+    return RISK_MAX_LEVERAGE
+
+def liquidation_buffer_pct(leverage):
+    if leverage <= 0: return 0.0
+    stop_move_pct = STOP_LOSS_ROI_PCT / leverage
+    estimated_liq_move_pct = 100.0 / leverage
+    return estimated_liq_move_pct - stop_move_pct
+
+def calculate_position_size(balance, signal, entry_price):
+    if entry_price <= 0 or balance <= 0: return 0.0, 0.0, MIN_LEVERAGE
+    target_notional = MIN_NOTIONAL * 1.03
+    confidence = parse_int(signal.get("confidence"), 0)
+    leverage_cap = risk_leverage_cap(confidence)
+    margin_cap = min(balance * MAX_MARGIN_PER_TRADE_FRACTION, max(0.0, balance - MIN_FREE_BALANCE_USDT))
+    if margin_cap <= 0:
+        return 0.0, 0.0, MIN_LEVERAGE
+    min_required_leverage = math.ceil(target_notional / margin_cap)
+    requested_leverage = max(MIN_LEVERAGE, min(MAX_LEVERAGE, parse_int(signal.get("leverage"), MIN_LEVERAGE)))
+    leverage = max(MIN_LEVERAGE, min(max(requested_leverage, min_required_leverage), leverage_cap))
+    if leverage < min_required_leverage or liquidation_buffer_pct(leverage) < MIN_LIQUIDATION_BUFFER_PCT:
+        return 0.0, 0.0, leverage
+    margin = parse_float(signal.get("margin_usdt"), 0.0)
+    size = parse_float(signal.get("size"), 0.0)
+    if margin <= 0 and size > 0:
+        margin = (size * entry_price) / leverage
+    min_margin = target_notional / leverage
+    if margin <= 0:
+        margin = min_margin
+    margin = min(max(margin, min_margin), margin_cap)
+    size = (margin * leverage) / entry_price
+    if margin <= 0 or margin > balance or size <= 0:
+        return 0.0, 0.0, leverage
+    return normalize_order_size(size), margin, leverage
+
+def calculate_roi_prices(entry_price, hold_side, leverage):
+    price_move_tp = TAKE_PROFIT_ROI_PCT / (leverage * 100)
+    price_move_sl = STOP_LOSS_ROI_PCT / (leverage * 100)
+    if hold_side == "long":
+        tp_price = entry_price * (1 + price_move_tp)
+        sl_price = entry_price * (1 - price_move_sl)
+    else:
+        tp_price = entry_price * (1 - price_move_tp)
+        sl_price = entry_price * (1 + price_move_sl)
+    return round(tp_price, 8), round(sl_price, 8)
 
 def analyze_with_learning(symbol):
     perf = get_pair_performance(symbol)
@@ -306,19 +663,21 @@ LEVERAGE: {MIN_LEVERAGE}-{MAX_LEVERAGE}
         return {"decision": decision, "confidence": confidence, "reasoning": data.get("REASONING", ""), "leverage": leverage}
     except: return None
 
-def calculate_position_size(balance, leverage, entry_price):
-    max_notional = balance * (MAX_NOTIONAL_PCT / 100)
-    size = (max_notional * leverage) / entry_price
-    return math.floor(size * 100) / 100
+def calculate_position_roi_pct(position):
+    entry_price = parse_float(position.get("openPriceAvg"), 0.0)
+    current_price = float(position.get("markPrice", entry_price))
+    leverage = max(1, parse_int(position.get("leverage"), MIN_LEVERAGE))
+    size = get_position_size_value(position)
+    hold_side = position.get("holdSide", "long")
+    if entry_price <= 0 or current_price <= 0 or size <= 0: return 0.0
+    gross_pnl = (current_price - entry_price) * size if hold_side == "long" else (entry_price - current_price) * size
+    fee = estimate_round_trip_fee(entry_price, current_price, size)
+    margin = (entry_price * size) / leverage
+    if margin <= 0: return 0.0
+    return ((gross_pnl - fee) / margin) * 100
 
 def check_stop_loss(position, entry_price):
-    current_price = float(position.get("markPrice", 0))
-    hold_side = position.get("holdSide", "long")
-    if hold_side == "long":
-        loss_pct = ((current_price - entry_price) / entry_price) * 100
-    else:
-        loss_pct = ((entry_price - current_price) / entry_price) * 100
-    return loss_pct <= -STOP_LOSS_PCT
+    return calculate_position_roi_pct(position) <= -STOP_LOSS_ROI_PCT
 
 def check_trailing_stop(symbol, current_pnl):
     if current_pnl <= 0: return False
@@ -332,101 +691,157 @@ def check_trailing_stop(symbol, current_pnl):
     drawdown_pct = ((highest - current_pnl) / highest) * 100
     return drawdown_pct >= TRAILING_STOP_PCT
 
+def get_position_size_value(position):
+    size = parse_float(position.get("size"), 0.0)
+    if size <= 0:
+        size = parse_float(position.get("available"), 0.0)
+    if size <= 0:
+        size = parse_float(position.get("total"), 0.0)
+    return size
+
+def estimate_position_net_pnl(position, current_price=None):
+    entry_price = parse_float(position.get("openPriceAvg"), 0.0)
+    current_price = parse_float(current_price, 0.0) if current_price is not None else parse_float(position.get("markPrice", entry_price), entry_price)
+    hold_side = position.get("holdSide", "long")
+    size = get_position_size_value(position)
+    if entry_price <= 0 or current_price <= 0 or size <= 0:
+        return 0.0, 0.0, 0.0, current_price, size
+    net_pnl, fee = calculate_net_pnl(entry_price, current_price, size, hold_side)
+    return net_pnl, fee, size, current_price, entry_price
+
 def find_and_trade():
-    global last_trade_time, daily_pnl, force_trade, consecutive_losses
-    if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
-        logger.warning(f"Paused - {consecutive_losses} consecutive losses")
-        send_telegram(f"⚠️ <b>Auto-paused</b>\n{consecutive_losses} consecutive losses\nUse /trade to resume")
+    global last_trade_time, force_trade, daily_profit_locked
+    positions = get_strategy_positions()
+    balance = get_strategy_balance()
+    today_net_pnl = get_strategy_today_net_pnl()
+    if today_net_pnl >= DAILY_NET_PROFIT_TARGET_USD:
+        if not daily_profit_locked:
+            send_telegram(f"✅ <b>Daily net target reached</b>\nNet PnL: <b>{today_net_pnl:.4f} USDT</b>\nTarget: <b>{DAILY_NET_PROFIT_TARGET_USD:.4f} USDT</b>\nNew entries paused until next restart/day.")
+            daily_profit_locked = True
+        logger.info(f"Daily net profit target reached: {today_net_pnl:.4f}/{DAILY_NET_PROFIT_TARGET_USD:.4f}; entries paused")
+        force_trade = False
         return
-    daily_pnl = get_today_pnl()
-    if daily_pnl <= -MAX_DAILY_LOSS_USD:
-        logger.warning(f"Daily loss limit hit: {daily_pnl:.4f} USDT")
-        send_telegram(f"🛑 <b>DAILY LOSS LIMIT</b>\nPnL: {daily_pnl:.4f} USDT\nPaused until tomorrow.")
-        return
-    positions = get_positions()
-    if len(positions) >= MAX_POSITIONS:
-        logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}")
-        return
-    if not force_trade:
-        elapsed = (time.time() - last_trade_time) / 60
-        if elapsed < TRADE_COOLDOWN_MIN:
-            logger.info(f"Cooldown: {TRADE_COOLDOWN_MIN - elapsed:.1f} min remaining")
-            return
-    force_trade = False
-    balance = get_balance()
-    if balance < 0.10:
-        logger.warning(f"Balance too low: {balance:.4f} USDT")
-        send_telegram(f"⚠️ Balance too low: {balance:.4f} USDT")
-        return
-    update_blacklist()
+    if DRY_RUN:
+        logger.info(f"Dry-run paper balance: {balance:.4f} USDT | Real balance: {get_balance():.4f} USDT")
     tickers = get_tickers()
-    candidates = [t for t in tickers if float(t.get("lastPr", 999)) < MAX_PRICE and float(t.get("baseVolume", 0)) > 0 and t["symbol"] not in blacklisted_pairs]
+    candidates = [t for t in tickers if t.get("symbol") and parse_float(t.get("lastPr")) > 0 and parse_float(t.get("baseVolume")) > 0]
+    candidates = sorted(candidates, key=lambda x: parse_float(x.get("baseVolume")), reverse=True)[:SIGNAL_SCAN_COUNT]
     if not candidates:
         logger.info("No candidates found")
+        send_telegram("📊 <b>Top signals</b>\nNo ticker data available this cycle.")
+        force_trade = False
         return
-    candidates = sorted(candidates, key=lambda x: float(x.get("baseVolume", 0)), reverse=True)[:3]
-    for ticker in candidates:
-        symbol = ticker["symbol"]
-        if symbol in [p["symbol"] for p in positions]: continue
-        logger.info(f"Analyzing {symbol}...")
-        analysis = analyze_with_learning(symbol)
-        if not analysis or analysis["decision"] == "SKIP": continue
-        decision, leverage, confidence, reasoning = analysis["decision"], analysis["leverage"], analysis["confidence"], analysis["reasoning"]
-        hold_side = "long" if decision == "LONG" else "short"
-        set_leverage(symbol, leverage, hold_side)
-        price = float(ticker.get("lastPr", 0))
-        size = calculate_position_size(balance, leverage, price)
+    logger.info(f"Analyzing {len(candidates)} tickers...")
+    signals = analyze_top_signals(candidates, balance)
+    send_top_signals(signals, balance, len(positions))
+    force_trade = False
+    if len(positions) >= MAX_POSITIONS:
+        logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}; signals only")
+        return
+    ticker_map = {t["symbol"]: t for t in candidates}
+    existing_symbols = {p["symbol"] for p in positions}
+    preferred = [s for s in signals if s["open"]]
+    fallback = [s for s in signals if not s["open"]]
+    if preferred:
+        order_candidates = preferred + fallback
+    elif DRY_RUN:
+        order_candidates = sorted(fallback, key=lambda s: (-s["confidence"], s["rank"]))
+    else:
+        order_candidates = []
+    opened = 0
+    max_to_open = min(MAX_ORDERS_PER_CYCLE, MAX_POSITIONS - len(positions))
+    for signal in order_candidates:
+        if opened >= max_to_open: break
+        symbol = signal["symbol"]
+        if symbol in existing_symbols: continue
+        if signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]: continue
+        price = parse_float(ticker_map.get(symbol, {}).get("lastPr"), signal.get("price", 0.0))
+        size, margin, leverage = calculate_position_size(balance, signal, price)
         notional = size * price
-        if notional < MIN_NOTIONAL or notional > balance * (MAX_NOTIONAL_PCT / 100):
-            logger.warning(f"Invalid notional for {symbol}: {notional:.4f}")
+        if price <= 0 or size <= 0 or margin <= 0 or margin > balance or notional < MIN_NOTIONAL:
+            logger.info(f"Skipping {symbol} - cannot meet minimum with balance/leverage")
             continue
+        decision, confidence, reasoning = signal["direction"], signal["confidence"], signal["reason"]
+        hold_side = "long" if decision == "LONG" else "short"
         side = "buy" if decision == "LONG" else "sell"
-        res = place_order(symbol, side, size, hold_side)
+        tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage)
+        if DRY_RUN:
+            dry_action = f"DRY_{decision}"
+            save_trade_open(symbol, dry_action, price, size, leverage, confidence)
+            last_trade_time = time.time()
+            msg = (f"🧪 <b>DRY RUN {decision} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
+                   f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
+                   f"Leverage: <b>{leverage}x</b>\nConfidence: <b>{confidence}%</b>\n"
+                   f"TP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b> @ <b>{tp_price}</b>\n"
+                   f"SL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b> @ <b>{sl_price}</b>\n"
+                   f"Fee model: <b>{TAKER_FEE_RATE * 100:.2f}% taker each side</b>\n\n💡 {reasoning}")
+            send_telegram(msg)
+            logger.info(f"DRY RUN opened {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
+            opened += 1
+            existing_symbols.add(symbol)
+            continue
+        lev_res = set_leverage(symbol, leverage, hold_side)
+        if lev_res.get("code") != "00000":
+            logger.warning(f"Skipping {symbol} - leverage failed: {lev_res.get('msg')}")
+            continue
+        res = place_order(symbol, side, size, hold_side, tp_price, sl_price)
         if res.get("code") == "00000":
             save_trade_open(symbol, decision, price, size, leverage, confidence)
             last_trade_time = time.time()
             msg = (f"🟢 <b>{decision} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
-                   f"Size: <b>{size}</b> | Notional: <b>{notional:.2f} USDT</b>\nLeverage: <b>{leverage}x</b>\n"
-                   f"Confidence: <b>{confidence}%</b>\nTarget TP: <b>{TAKE_PROFIT_USD} USDT</b>\nSL: <b>-{STOP_LOSS_PCT}%</b>\n\n💡 {reasoning}")
+                   f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
+                   f"Leverage: <b>{leverage}x</b>\nConfidence: <b>{confidence}%</b>\n"
+                   f"TP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b> @ <b>{tp_price}</b>\n"
+                   f"SL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b> @ <b>{sl_price}</b>\n\n💡 {reasoning}")
             send_telegram(msg)
             logger.info(f"Opened {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
-            return
+            opened += 1
+            existing_symbols.add(symbol)
         else:
             logger.error(f"Order failed for {symbol}: {res.get('msg')}")
-    logger.info("No valid setup found")
+    if opened == 0:
+        logger.info("No orders opened this cycle")
 
 def manage_positions():
     global consecutive_losses
-    positions = get_positions()
+    positions = get_strategy_positions()
     if not positions: return
     for p in positions:
-        symbol, hold_side, pnl, entry, current = p["symbol"], p.get("holdSide", "long"), float(p.get("unrealizedPL", 0)), float(p.get("openPriceAvg", 0)), float(p.get("markPrice", 0))
-        if pnl >= TAKE_PROFIT_USD:
-            res = close_position_api(symbol, hold_side)
+        symbol, hold_side, entry = p["symbol"], p.get("holdSide", "long"), float(p.get("openPriceAvg", 0))
+        if DRY_RUN:
+            ticker = next((t for t in get_tickers() if t.get("symbol") == symbol), {})
+            current = parse_float(ticker.get("lastPr"), entry)
+            leverage = max(1, parse_int(p.get("leverage"), MIN_LEVERAGE))
+            net_pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+            pnl = net_pnl
+            p["markPrice"] = current
+            p["unrealizedPL"] = pnl
+            p["leverage"] = leverage
+        else:
+            current = float(p.get("markPrice", 0))
+            net_pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+            pnl = net_pnl if size > 0 else float(p.get("unrealizedPL", 0))
+        roi_pct = calculate_position_roi_pct(p)
+        if roi_pct >= TAKE_PROFIT_ROI_PCT:
+            res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             if res.get("code") == "00000":
-                save_trade_close(symbol, current, pnl)
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
                 if symbol in trailing_stops: del trailing_stops[symbol]
                 consecutive_losses = 0
-                send_telegram(f"✅ <b>TAKE PROFIT</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nPnL: <b>+{pnl:.4f} USDT</b>")
-                logger.info(f"TP hit {symbol} | PnL: {pnl:.4f}")
+                prefix = "DRY RUN " if DRY_RUN else ""
+                send_telegram(f"✅ <b>{prefix}TAKE PROFIT</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>+{roi_pct:.2f}%</b>\nNet PnL: <b>+{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+                logger.info(f"{prefix}TP hit {symbol} | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f} | Fee: {fee:.4f}")
                 continue
         if check_stop_loss(p, entry):
-            res = close_position_api(symbol, hold_side)
+            res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             if res.get("code") == "00000":
-                save_trade_close(symbol, current, pnl)
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
                 if symbol in trailing_stops: del trailing_stops[symbol]
                 consecutive_losses += 1
-                send_telegram(f"🛑 <b>STOP LOSS</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nPnL: <b>{pnl:.4f} USDT</b>\nConsecutive losses: {consecutive_losses}")
-                logger.info(f"SL hit {symbol} | PnL: {pnl:.4f}")
+                prefix = "DRY RUN " if DRY_RUN else ""
+                send_telegram(f"🛑 <b>{prefix}STOP LOSS</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>\nConsecutive losses: {consecutive_losses}")
+                logger.info(f"{prefix}SL hit {symbol} | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f} | Fee: {fee:.4f}")
                 continue
-        if pnl > 0 and check_trailing_stop(symbol, pnl):
-            res = close_position_api(symbol, hold_side)
-            if res.get("code") == "00000":
-                save_trade_close(symbol, current, pnl)
-                if symbol in trailing_stops: del trailing_stops[symbol]
-                consecutive_losses = 0
-                send_telegram(f"📉 <b>TRAILING STOP</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nPnL: <b>+{pnl:.4f} USDT</b>")
-                logger.info(f"Trailing stop {symbol} | PnL: {pnl:.4f}")
 
 def handle_commands():
     global bot_running, force_trade, consecutive_losses
@@ -436,22 +851,32 @@ def handle_commands():
             updates = get_telegram_updates()
             for u in updates:
                 msg, chat_id, text = u.get("message", {}), str(u.get("message", {}).get("chat", {}).get("id", "")), u.get("message", {}).get("text", "").strip().lower()
-                if chat_id != TELEGRAM_CHAT_ID: continue
+                if chat_id not in TELEGRAM_CHAT_IDS: continue
                 if text == "/status":
-                    positions, balance, daily_pnl = get_positions(), get_balance(), get_today_pnl()
+                    positions, balance, daily_pnl = get_strategy_positions(), get_strategy_balance(), get_strategy_today_net_pnl()
+                    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
                     if not positions:
-                        send_telegram(f"📊 <b>Status</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nPositions: <b>0/{MAX_POSITIONS}</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
+                        send_telegram(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nPositions: <b>0/{MAX_POSITIONS}</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
                     else:
-                        lines = [f"📊 <b>Status</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nPositions: <b>{len(positions)}/{MAX_POSITIONS}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
+                        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nPositions: <b>{len(positions)}/{MAX_POSITIONS}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
                         for p in positions:
-                            pnl, entry, current = float(p.get("unrealizedPL", 0)), float(p.get("openPriceAvg", 0)), float(p.get("markPrice", 0))
+                            entry = float(p.get("openPriceAvg", 0))
+                            if DRY_RUN:
+                                ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
+                                current = parse_float(ticker.get("lastPr"), entry)
+                                pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+                            else:
+                                current = float(p.get("markPrice", 0))
+                                pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
                             emoji = "🟢" if pnl > 0 else "🔴"
                             pnl_pct = ((current - entry) / entry * 100) if p.get("holdSide") == "long" else ((entry - current) / entry * 100)
-                            lines.append(f"{emoji} {p.get('holdSide','').upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nPnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>")
+                            lines.append(f"{emoji} {p.get('holdSide','').upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                         send_telegram("\n\n".join(lines))
                 elif text == "/balance":
-                    balance, daily_pnl = get_balance(), get_today_pnl()
-                    send_telegram(f"💰 <b>Balance</b>\nAvailable: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>")
+                    balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
+                    real_balance = get_balance() if DRY_RUN else balance
+                    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+                    send_telegram(f"💰 <b>Balance</b>\nMode: <b>{mode}</b>\nAvailable: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>")
                 elif text == "/history":
                     summary = get_trade_summary()
                     if not summary:
@@ -462,6 +887,24 @@ def handle_commands():
                     force_trade = True
                     consecutive_losses = 0
                     send_telegram("⚡ Starting analysis...")
+                elif text.startswith("/mode"):
+                    parts = text.split()
+                    if len(parts) == 1:
+                        send_telegram(f"⚙️ <b>Mode</b>\nCurrent: <b>{TRADE_MODE.upper()}</b>\nAvailable: <b>NORMAL</b>, <b>SCALPING</b>\nUse /mode normal or /mode scalping")
+                    else:
+                        requested = parts[1].strip().lower()
+                        if requested in ("biasa", "normal", "trade"):
+                            requested = "normal"
+                        elif requested in ("scalp", "scalping"):
+                            requested = "scalping"
+                        else:
+                            send_telegram("⚠️ Mode tidak dikenal. Pilih: /mode normal atau /mode scalping")
+                            continue
+                        if apply_trade_mode(requested):
+                            send_telegram(f"✅ <b>Mode changed</b>\nCurrent: <b>{TRADE_MODE.upper()}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b>\nSL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b>\nSleep: <b>{SLEEP_MINUTES} min</b>")
+                            logger.info(f"Trade mode changed to {TRADE_MODE.upper()}")
+                        else:
+                            send_telegram("⚠️ Gagal mengubah mode.")
                 elif text.startswith("/close"):
                     parts = text.split()
                     if len(parts) == 1:
@@ -469,25 +912,28 @@ def handle_commands():
                         close_all_positions()
                     else:
                         sym = parts[1].upper()
-                        positions = get_positions()
+                        positions = get_strategy_positions() if DRY_RUN else get_positions()
                         pos = next((p for p in positions if p["symbol"].upper() == sym), None)
                         if not pos:
                             send_telegram(f"⚠️ No position for {sym}")
                         else:
-                            hold, pnl, price = pos.get("holdSide", "long"), float(pos.get("unrealizedPL", 0)), float(pos.get("markPrice", 0))
-                            res = close_position_api(sym, hold)
+                            hold = pos.get("holdSide", "long")
+                            price = float(pos.get("markPrice", pos.get("openPriceAvg", 0)))
+                            pnl, fee, size, current, entry = estimate_position_net_pnl(pos, price)
+                            res = {"code": "00000"} if DRY_RUN else close_position_api(sym, hold)
                             if res.get("code") == "00000":
-                                save_trade_close(sym, price, pnl)
+                                save_trade_close_by_id(pos["id"], price, pnl) if DRY_RUN else save_trade_close(sym, price, pnl)
                                 if sym in trailing_stops: del trailing_stops[sym]
                                 emoji = "✅" if pnl > 0 else "❌"
-                                send_telegram(f"{emoji} <b>CLOSED</b> {hold.upper()} {sym}\nPnL: <b>{pnl:.4f} USDT</b>")
+                                prefix = "DRY RUN " if DRY_RUN else ""
+                                send_telegram(f"{emoji} <b>{prefix}CLOSED</b> {hold.upper()} {sym}\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                             else:
                                 send_telegram(f"⚠️ Failed to close {sym}: {res.get('msg')}")
                 elif text == "/stop":
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
                 elif text == "/help":
-                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMax positions: {MAX_POSITIONS}\nStop loss: -{STOP_LOSS_PCT}%\nTake profit: ${TAKE_PROFIT_USD}\nMax daily loss: ${MAX_DAILY_LOSS_USD}")
+                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now\n/mode [normal|scalping] — switch trading mode\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nMax positions: {MAX_POSITIONS}\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nMax daily loss: ${MAX_DAILY_LOSS_USD}")
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
@@ -496,21 +942,31 @@ def handle_commands():
 def main():
     global bot_running
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
-    send_telegram(f"🤖 <b>Bitget LLM Bot V2</b>\n🧠 <b>Learning Edition</b>\n\nMax positions: <b>{MAX_POSITIONS}</b>\nStop loss: <b>-{STOP_LOSS_PCT}%</b>\nTake profit: <b>${TAKE_PROFIT_USD}</b>\nTrailing stop: <b>{TRAILING_STOP_PCT}%</b>\nMax daily loss: <b>${MAX_DAILY_LOSS_USD}</b>\nMin confidence: <b>{MIN_CONFIDENCE}%</b>\n\nType /help for commands.")
+    send_telegram(f"🤖 <b>Bitget LLM Bot V2</b>\n🧠 <b>Learning Edition</b>\n\nMode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nMax positions: <b>{MAX_POSITIONS}</b>\nScan: <b>{SIGNAL_SCAN_COUNT} tickers / {SLEEP_MINUTES} min</b>\nTop signals: <b>{TOP_SIGNAL_COUNT}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b>\nSL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b>\nMin confidence: <b>{MIN_CONFIDENCE}%</b>\n\nType /help for commands.")
     init_db()
     t = threading.Thread(target=handle_commands, daemon=True)
     t.start()
     while bot_running:
         try:
-            positions, balance = get_positions(), get_balance()
-            logger.info(f"Balance: {balance:.4f} | Positions: {len(positions)}/{MAX_POSITIONS}")
+            positions = get_strategy_positions()
+            balance = get_strategy_balance()
+            real_balance = get_balance() if DRY_RUN else balance
+            logger.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()} | Paper balance: {balance:.4f} | Real balance: {real_balance:.4f} | Positions: {len(positions)}/{MAX_POSITIONS}")
             if positions:
                 for p in positions:
-                    pnl = float(p.get("unrealizedPL", 0))
-                    logger.info(f"Position: {p.get('holdSide','').upper()} {p['symbol']} | PnL: {pnl:.4f}")
+                    if DRY_RUN:
+                        ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
+                        entry = float(p.get("openPriceAvg", 0))
+                        pnl, fee, size, current, entry = estimate_position_net_pnl(p, parse_float(ticker.get("lastPr"), entry))
+                    else:
+                        pnl, fee, size, current, entry = estimate_position_net_pnl(p, float(p.get("markPrice", 0)))
+                    logger.info(f"Position: {p.get('holdSide','').upper()} {p['symbol']} | Net PnL: {pnl:.4f} | Est. fees: {fee:.4f}")
                 manage_positions()
-            if len(positions) < MAX_POSITIONS: find_and_trade()
-            if not force_trade:
+            find_and_trade()
+            if DRY_RUN and get_strategy_positions():
+                logger.info(f"Dry-run positions active; sleeping {DRY_RUN_POLL_SECONDS} sec...")
+                time.sleep(DRY_RUN_POLL_SECONDS)
+            elif not force_trade:
                 logger.info(f"Sleeping {SLEEP_MINUTES} min...")
                 time.sleep(SLEEP_MINUTES * 60)
             else:
@@ -525,4 +981,17 @@ def main():
     logger.info("Bot stopped")
 
 if __name__ == "__main__":
-    main()
+    ensure_daemonized()
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logger.error(f"Fatal bot error: {e}")
+            time.sleep(5)
+            continue
+        if not bot_running:
+            break
+        logger.warning("Bot main loop exited unexpectedly; restarting in 5 sec...")
+        time.sleep(5)
