@@ -1,89 +1,112 @@
-# Bitget LLM Trading Bot V2
+# King Bitget Bot
 
-AI-powered futures trading bot with learning system for small capital ($1-10).
+LLM-assisted Bitget USDT futures bot with dry-run learning mode, Telegram controls, and selectable normal/scalping trade profiles.
 
-## Features
-- Max 2 positions | SL -10% | TP $0.50
-- Learning from trade history
-- Auto blacklist bad pairs
-- Multi-timeframe LLM analysis (Groq)
+## Current Mode
 
-## Quick Setup
+The bot is currently designed to run in dry-run mode first:
 
-### 1. Get API Keys
-- **Bitget:** https://www.bitget.com (Classic Account, Futures permission)
-- **Groq:** https://console.groq.com (free)
-- **Telegram:** @BotFather
+- `DRY_RUN = True`
+- Paper balance: `5.0 USDT`
+- Default trade mode: `scalping`
+- No real Bitget orders are placed while dry-run is enabled
+- Simulated trades are saved to the local SQLite trade history
 
-### 2. Install
-```bash
-git clone https://github.com/salsabila2507/bitget-llm-bot.git
-cd bitget-llm-bot
-pip3 install requests --break-system-packages
+## Strategy Rules
+
+- Analyze the top 50 tickers by volume
+- Send the top 10 signals to Telegram
+- Maximum 2 open positions
+- Trade only when confidence meets the active mode threshold
+- Track net PnL after estimated taker fees
+- Learn from recent trade history, pair performance, and LONG/SHORT results
+
+## Trade Modes
+
+### Scalping
+
+Default active mode.
+
+- Scan interval: 5 minutes
+- TP: 10% ROI
+- SL: 6% ROI
+- Min confidence: 72%
+- Intended for small dry-run capital and faster simulated exits
+
+### Normal
+
+Original slower trading profile.
+
+- Scan interval: 60 minutes
+- TP: 70% ROI
+- SL: 40% ROI
+- Min confidence: 70%
+
+Switch mode from Telegram:
+
+```text
+/mode scalping
+/mode normal
 ```
 
-### 3. Configure
-Edit `bitget_llm_trader_clean.py`, replace:
-```python
-API_KEY = "your_bitget_api_key"
-SECRET_KEY = "your_bitget_secret"
-PASSPHRASE = "your_passphrase"
-GROQ_API_KEY = "gsk_your_groq_key"
-TELEGRAM_TOKEN = "your_bot_token"
-TELEGRAM_CHAT_ID = "your_chat_id"
-```
-Save as `bitget_llm_trader.py`
+## LLM Provider
 
-### 4. Run
-```bash
-python3 bitget_llm_trader.py
-```
+The bot uses the NVIDIA OpenAI-compatible API.
 
-## Production (Systemd)
-```bash
-sudo tee /etc/systemd/system/bitget-trader.service << 'EOF'
-[Unit]
-Description=Bitget LLM Bot
-After=network.target
+Kimi 2.6 was checked but timed out in the current setup, so the active fallback model is:
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/bitget-llm-bot
-ExecStart=/usr/bin/python3 /root/bitget-llm-bot/bitget_llm_trader.py
-Restart=always
-StandardOutput=append:/root/bitget-llm-bot/bot.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable bitget-trader
-sudo systemctl start bitget-trader
+```text
+meta/llama-3.3-70b-instruct
 ```
 
 ## Telegram Commands
-- `/status` - positions + PnL
-- `/balance` - balance
-- `/history` - stats
-- `/trade` - force trade
-- `/close` - close all
 
-## Troubleshooting
-
-**Spam messages:**
-```bash
-curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates?offset=-1" > /dev/null
-sudo systemctl restart bitget-trader
+```text
+/status              positions + PnL
+/balance             paper balance, real balance, daily PnL
+/history             trade stats
+/trade               force a scan now
+/mode                show current mode
+/mode scalping       switch to scalping mode
+/mode normal         switch to normal mode
+/close               close all positions
+/close SYMBOL        close one position
+/stop                stop the bot
+/help                show commands
 ```
 
-**Multiple instances:**
+Only configured Telegram chat IDs are allowed to control the bot.
+
+## Run
+
+From the project directory:
+
 ```bash
-pkill -9 -f bitget_llm_trader
-sudo systemctl start bitget-trader
+cd /root/bitget-llm-bot
+python3 -m py_compile bitget_llm_trader.py
+setsid -f env BITGET_BOT_DAEMON=1 python3 -u bitget_llm_trader.py > bot.log 2>&1 < /dev/null
 ```
+
+Check status:
+
+```bash
+pgrep -af bitget_llm_trader.py
+tail -n 50 bot.log
+```
+
+Stop:
+
+```bash
+pkill -f '[b]itget_llm_trader.py'
+```
+
+## Runtime Notes
+
+- The bot needs network access to `api.bitget.com`, Telegram, and the NVIDIA API.
+- If Bitget DNS/network fails, the bot may stay alive but cannot fetch fresh tickers or update dry-run PnL correctly.
+- If there are already 2 open dry-run positions, the bot will continue scanning and sending signals but will not open another simulated trade until a position closes.
+- Dry-run mode is for learning and validation only. It does not guarantee real trading profit.
 
 ## Disclaimer
-⚠️ High risk. Test with $1 first. Not financial advice.
 
-MIT License
+This is experimental trading automation. Futures trading is high risk. Dry-run results are not proof of live-market profitability.
