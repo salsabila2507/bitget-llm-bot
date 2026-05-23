@@ -6,15 +6,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
     handlers=[logging.FileHandler('/root/bitget-llm-bot/bitget_bot.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
-API_KEY = ""
-SECRET_KEY = ""
-PASSPHRASE = ""
+API_KEY = os.environ.get("BITGET_API_KEY", "")
+SECRET_KEY = os.environ.get("BITGET_SECRET_KEY", "")
+PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
 BASE_URL = "https://api.bitget.com"
-NVIDIA_API_KEY = ""
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_MODEL = "meta/llama-3.3-70b-instruct"
-TELEGRAM_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_CHAT_IDS = set()
 DRY_RUN = True
 DRY_RUN_BALANCE = 5.0
