@@ -70,7 +70,9 @@ SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
 MAX_POSITIONS, MAX_ORDERS_PER_CYCLE = 2, 2
 TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
 MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.75, 10
-TRAILING_STOP_PCT, MIN_CONFIDENCE = (1.5, 72) if TRADE_MODE == "scalping" else (3.0, 70)
+TRAILING_STOP_PCT, MIN_CONFIDENCE = (3.0, 72) if TRADE_MODE == "scalping" else (3.0, 70)
+TRAILING_ACTIVATE_ROI_PCT = 3.0 if TRADE_MODE == "scalping" else 20.0
+MIN_TRAILING_PROFIT_ROI_PCT = 1.5 if TRADE_MODE == "scalping" else 10.0
 CONSECUTIVE_LOSS_LIMIT = 3
 TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
@@ -89,19 +91,23 @@ TRADE_PROFILES = {
         "take_profit_roi_pct": 70.0,
         "stop_loss_roi_pct": 40.0,
         "trailing_stop_pct": 3.0,
+        "trailing_activate_roi_pct": 20.0,
+        "min_trailing_profit_roi_pct": 10.0,
         "min_confidence": 70,
     },
     "scalping": {
         "sleep_minutes": 5,
         "take_profit_roi_pct": 10.0,
         "stop_loss_roi_pct": 6.0,
-        "trailing_stop_pct": 1.5,
+        "trailing_stop_pct": 3.0,
+        "trailing_activate_roi_pct": 3.0,
+        "min_trailing_profit_roi_pct": 1.5,
         "min_confidence": 72,
     },
 }
 
 def apply_trade_mode(mode):
-    global TRADE_MODE, SLEEP_MINUTES, TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT, TRAILING_STOP_PCT, MIN_CONFIDENCE
+    global TRADE_MODE, SLEEP_MINUTES, TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT, TRAILING_STOP_PCT, MIN_CONFIDENCE, TRAILING_ACTIVATE_ROI_PCT, MIN_TRAILING_PROFIT_ROI_PCT
     mode = str(mode).strip().lower()
     if mode not in TRADE_PROFILES:
         return False
@@ -111,6 +117,8 @@ def apply_trade_mode(mode):
     TAKE_PROFIT_ROI_PCT = profile["take_profit_roi_pct"]
     STOP_LOSS_ROI_PCT = profile["stop_loss_roi_pct"]
     TRAILING_STOP_PCT = profile["trailing_stop_pct"]
+    TRAILING_ACTIVATE_ROI_PCT = profile["trailing_activate_roi_pct"]
+    MIN_TRAILING_PROFIT_ROI_PCT = profile["min_trailing_profit_roi_pct"]
     MIN_CONFIDENCE = profile["min_confidence"]
     return True
 
@@ -1013,17 +1021,23 @@ def calculate_position_roi_pct(position):
 def check_stop_loss(position, entry_price):
     return calculate_position_roi_pct(position) <= -STOP_LOSS_ROI_PCT
 
-def check_trailing_stop(symbol, current_pnl):
-    if current_pnl <= 0: return False
+def check_trailing_stop(symbol, current_roi_pct):
+    # Arm trailing only after the trade clears fees with margin to spare.
     if symbol not in trailing_stops:
-        trailing_stops[symbol] = current_pnl
+        if current_roi_pct < TRAILING_ACTIVATE_ROI_PCT:
+            return False
+        trailing_stops[symbol] = current_roi_pct
         return False
     highest = trailing_stops[symbol]
-    if current_pnl > highest:
-        trailing_stops[symbol] = current_pnl
+    if current_roi_pct > highest:
+        trailing_stops[symbol] = current_roi_pct
         return False
-    drawdown_pct = ((highest - current_pnl) / highest) * 100
-    return drawdown_pct >= TRAILING_STOP_PCT
+    # Never trail-out below the minimum net-profit floor — otherwise we'd
+    # just be paying round-trip fees to scratch in and out.
+    if current_roi_pct < MIN_TRAILING_PROFIT_ROI_PCT:
+        return False
+    drawdown_pct_of_peak = ((highest - current_roi_pct) / highest) * 100
+    return drawdown_pct_of_peak >= TRAILING_STOP_PCT
 
 def get_position_size_value(position):
     size = parse_float(position.get("size"), 0.0)
@@ -1326,7 +1340,7 @@ def handle_commands():
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
                 elif text == "/help":
-                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now (clears cooldown)\n/mode [normal|scalping] — switch trading mode\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nTrailing: {TRAILING_STOP_PCT:.1f}% drawdown from peak\nTime stop: {MAX_HOLD_HOURS}h max hold\nMax daily loss: ${MAX_DAILY_LOSS_USD}\nConsec. loss limit: {CONSECUTIVE_LOSS_LIMIT} → {CONSECUTIVE_LOSS_COOLDOWN_MIN} min cooldown")
+                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now (clears cooldown)\n/mode [normal|scalping] — switch trading mode\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nTrailing: arm at +{TRAILING_ACTIVATE_ROI_PCT:.1f}% ROI, exit on {TRAILING_STOP_PCT:.1f}% drawdown, floor {MIN_TRAILING_PROFIT_ROI_PCT:.1f}% ROI\nTime stop: {MAX_HOLD_HOURS}h max hold\nMax daily loss: ${MAX_DAILY_LOSS_USD}\nConsec. loss limit: {CONSECUTIVE_LOSS_LIMIT} → {CONSECUTIVE_LOSS_COOLDOWN_MIN} min cooldown")
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
