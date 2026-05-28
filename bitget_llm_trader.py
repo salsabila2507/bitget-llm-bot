@@ -46,9 +46,9 @@ TAKER_FEE_RATE = 0.0006
 LLM_ERROR_COOLDOWN_SECONDS = 300
 LLM_REQUEST_TIMEOUT_SECONDS = 20
 RECENT_TRADE_LIMIT = 20
-DIRECTION_MIN_TRADES = 4
-DIRECTION_MIN_WIN_RATE = 45.0
-AUTO_BLOCK_LONG = True
+DIRECTION_MIN_TRADES = 5
+DIRECTION_BLOCK_WIN_RATE = 25.0
+DIRECTION_BLOCK_AVG_PNL = -0.10
 STALE_OPEN_TRADE_HOURS = 24
 
 MIN_NOTIONAL = 5.5
@@ -399,8 +399,15 @@ def direction_allowed(direction):
         return False
     stats = get_recent_direction_performance()
     d = stats[direction]
-    if AUTO_BLOCK_LONG and direction == "LONG":
-        return d["total"] >= DIRECTION_MIN_TRADES and d["win_rate"] >= DIRECTION_MIN_WIN_RATE and d["avg_pnl"] > 0
+    # Probe phase: not enough sample for this direction yet — let the strategy try
+    # so we can learn from both wins and losses instead of locking ourselves out.
+    if d["total"] < DIRECTION_MIN_TRADES:
+        return True
+    # Block only when recent data is decisively bad: both win rate AND avg PnL
+    # are below the danger thresholds. A direction with poor win rate but
+    # positive avg PnL (or vice versa) still gets to trade.
+    if d["win_rate"] < DIRECTION_BLOCK_WIN_RATE and d["avg_pnl"] < DIRECTION_BLOCK_AVG_PNL:
+        return False
     return True
 
 def get_learning_context():
@@ -433,8 +440,11 @@ def get_learning_context():
         for direction in ("LONG", "SHORT"):
             d = recent_direction_stats[direction]
             context += f"- {direction}: Win rate {d['win_rate']:.1f}% | Avg PnL: {d['avg_pnl']:.4f} USDT | Trades: {d['total']}\n"
-        if AUTO_BLOCK_LONG:
-            context += "\nAuto LONG entries are disabled until recent LONG performance becomes positive.\n"
+        blocked = [d for d in ("LONG", "SHORT") if not direction_allowed(d)]
+        if blocked:
+            context += f"\nCurrently blocked directions (recent win rate < {DIRECTION_BLOCK_WIN_RATE:.0f}% AND avg PnL < {DIRECTION_BLOCK_AVG_PNL:.2f}): {', '.join(blocked)}\n"
+        else:
+            context += "\nBoth LONG and SHORT are allowed; pick the side that price action and momentum support.\n"
         context += f"\nLast 5 trades:\n"
         for row in rows[:5]:
             symbol, action, pnl, conf = row
@@ -646,7 +656,10 @@ def analyze_top_signals_fallback(tickers, balance):
         chg_pct = parse_float(t.get("changeUtc24h", t.get("priceChangePercent", t.get("change24h", 0.0))), 0.0)
         if not symbol or price <= 0:
             continue
-        direction = "SHORT" if AUTO_BLOCK_LONG or chg_pct < 0 else "LONG"
+        # Momentum-following fallback: ride the 24h move direction so we can
+        # learn from both sides. The direction_allowed gate downstream will
+        # still skip a side that recent data shows is decisively losing.
+        direction = "LONG" if chg_pct >= 0 else "SHORT"
         confidence = MIN_CONFIDENCE + 2 if rank <= MAX_ORDERS_PER_CYCLE else max(50, MIN_CONFIDENCE - rank)
         leverage = LOW_CONFIDENCE_MAX_LEVERAGE
         margin = min(balance * MAX_MARGIN_PER_TRADE_FRACTION, max(0.0, balance - MIN_FREE_BALANCE_USDT))
@@ -699,8 +712,8 @@ Rules:
 4. You decide pair, LONG/SHORT, leverage, margin USDT, position size in base coin, and if the pair is possible with ${balance:.4f}.
 5. Use the lowest leverage that can meet Bitget minimum notional about {MIN_NOTIONAL} USDT. Avoid high leverage; unsafe setups above {RISK_MAX_LEVERAGE}x will be rejected.
 6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
-7. Use the learning context to compare LONG and SHORT performance separately. Do not default to LONG; choose SHORT when market momentum and history support it.
-8. If one direction has weak win rate or negative average net PnL, require stronger evidence before opening that direction.
+7. Use the learning context to compare LONG and SHORT performance separately. Pick the side that current price action, momentum, and recent results support — neither side is preferred by default.
+8. If one direction has weak win rate AND negative average net PnL in recent trades, require stronger evidence before opening that direction. Otherwise treat both sides as equally valid candidates.
 9. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs.
 
 Respond ONLY valid JSON:
