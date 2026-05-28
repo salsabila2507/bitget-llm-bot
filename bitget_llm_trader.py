@@ -6,29 +6,57 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
     handlers=[logging.FileHandler('/root/bitget-llm-bot/bitget_bot.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
+def load_runtime_env(path=".runtime.env"):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+    except Exception as e:
+        logger.error(f"Failed to load runtime env: {e}")
+
+load_runtime_env()
+
 API_KEY = os.environ.get("BITGET_API_KEY", "")
 SECRET_KEY = os.environ.get("BITGET_SECRET_KEY", "")
 PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
 BASE_URL = "https://api.bitget.com"
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-LLM_MODEL = "meta/llama-3.3-70b-instruct"
+LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-3.3-70b-instruct")
+LLM_FALLBACK_MODELS = [
+    "meta/llama-3.3-70b-instruct",
+    "moonshotai/kimi-k2.6",
+    "deepseek-ai/deepseek-v4-flash",
+    "qwen/qwen3-next-80b-a3b-instruct",
+]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_CHAT_IDS = set()
+TELEGRAM_CHAT_IDS = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if c.strip()}
 DRY_RUN = True
 DRY_RUN_BALANCE = 5.0
 DRY_RUN_POLL_SECONDS = 15
 TRADE_MODE = "scalping"
 TAKER_FEE_RATE = 0.0006
-DAILY_NET_PROFIT_TARGET_USD = 0.05
+LLM_ERROR_COOLDOWN_SECONDS = 300
+LLM_REQUEST_TIMEOUT_SECONDS = 20
+RECENT_TRADE_LIMIT = 20
+DIRECTION_MIN_TRADES = 4
+DIRECTION_MIN_WIN_RATE = 45.0
+AUTO_BLOCK_LONG = True
+STALE_OPEN_TRADE_HOURS = 24
 
 MIN_NOTIONAL = 5.5
 MIN_LEVERAGE, MAX_LEVERAGE = 1, 125
-RISK_MAX_LEVERAGE = 8
-LOW_CONFIDENCE_MAX_LEVERAGE = 5
-MID_CONFIDENCE_MAX_LEVERAGE = 7
-MAX_MARGIN_PER_TRADE_FRACTION = 0.45
+RISK_MAX_LEVERAGE = 5
+LOW_CONFIDENCE_MAX_LEVERAGE = 4
+MID_CONFIDENCE_MAX_LEVERAGE = 4
+MAX_MARGIN_PER_TRADE_FRACTION = 0.30
 MIN_FREE_BALANCE_USDT = 0.20
 MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
@@ -46,7 +74,7 @@ DB_PATH = "/root/trade_history.db"
 bot_running, force_trade, last_update_id = True, False, 0
 last_trade_time, daily_pnl = 0, 0.0
 trailing_stops, consecutive_losses, blacklisted_pairs = {}, 0, set()
-daily_profit_locked = False
+llm_cooldown_until, daily_loss_locked_date = 0, None
 
 TRADE_PROFILES = {
     "normal": {
@@ -121,28 +149,108 @@ def save_trade_close(symbol, exit_price, pnl):
     conn.commit()
     conn.close()
 
-def save_trade_close_by_id(trade_id, exit_price, pnl):
+def save_trade_close_by_id(trade_id, exit_price, pnl, action=None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE id=?",
-        (exit_price, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), trade_id))
+    if action is None:
+        conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE id=?",
+            (exit_price, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), trade_id))
+    else:
+        conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=?, action=? WHERE id=?",
+            (exit_price, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), action, trade_id))
     conn.commit()
     conn.close()
+
+def cleanup_stale_dry_run_positions():
+    if not DRY_RUN:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence, opened_at
+            FROM trades
+            WHERE closed_at IS NULL
+              AND action IN ('LONG', 'SHORT', 'DRY_LONG', 'DRY_SHORT', 'DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT')""")
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return
+        tickers = {t.get("symbol"): t for t in get_tickers()}
+        now = datetime.now()
+        closed = 0
+        for trade_id, symbol, action, entry_price, size, leverage, confidence, opened_at in rows:
+            try:
+                opened_dt = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                opened_dt = now
+            age_hours = (now - opened_dt).total_seconds() / 3600
+            if age_hours < STALE_OPEN_TRADE_HOURS:
+                continue
+            hold_side = direction_from_action(action)
+            current = parse_float(tickers.get(symbol, {}).get("lastPr"), parse_float(entry_price, 0.0))
+            position = {
+                "symbol": symbol,
+                "action": action,
+                "openPriceAvg": entry_price,
+                "size": size,
+                "leverage": leverage,
+                "confidence": confidence,
+                "holdSide": hold_side,
+            }
+            pnl, fee, size, current, entry = estimate_position_net_pnl(position, current)
+            stale_action = action if str(action).upper().startswith("STALE_") else f"STALE_{action}"
+            save_trade_close_by_id(trade_id, current, pnl, action=stale_action)
+            closed += 1
+            logger.info(f"Closed stale dry-run {hold_side.upper()} {symbol} id={trade_id} | Net PnL: {pnl:.4f} | Tagged {stale_action}")
+        if closed:
+            send_telegram(f"🧹 <b>Dry-run cleanup</b>\nClosed stale open paper trades: <b>{closed}</b>")
+    except Exception as e:
+        logger.error(f"cleanup_stale_dry_run_positions error: {e}")
+
+def is_manual_action(action):
+    return "MANUAL" in str(action).upper()
+
+def direction_from_action(action):
+    action = str(action).upper()
+    return "long" if "LONG" in action else "short"
 
 def get_dry_run_positions():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence
-            FROM trades WHERE closed_at IS NULL AND action IN ('DRY_LONG', 'DRY_SHORT')""")
+            FROM trades WHERE closed_at IS NULL AND action IN ('DRY_LONG', 'DRY_SHORT', 'DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT')""")
         rows = cur.fetchall()
         conn.close()
         return [{"id": r[0], "symbol": r[1], "action": r[2], "openPriceAvg": r[3],
                  "size": r[4], "leverage": r[5], "confidence": r[6],
-                 "holdSide": "long" if r[2] == "DRY_LONG" else "short"} for r in rows]
+                 "holdSide": direction_from_action(r[2])} for r in rows]
     except:
         return []
 
 def get_strategy_positions():
     return get_dry_run_positions() if DRY_RUN else get_positions()
+
+def get_open_manual_position_keys():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("""SELECT symbol, action FROM trades
+            WHERE closed_at IS NULL AND action IN ('DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT', 'MANUAL_LONG', 'MANUAL_SHORT')""")
+        rows = cur.fetchall()
+        conn.close()
+        return {(symbol, direction_from_action(action)) for symbol, action in rows}
+    except:
+        return set()
+
+def get_auto_strategy_positions():
+    positions = get_strategy_positions()
+    if DRY_RUN:
+        return [p for p in positions if not is_manual_action(p.get("action", ""))]
+    manual_keys = get_open_manual_position_keys()
+    return [p for p in positions if (p.get("symbol"), p.get("holdSide", "long")) not in manual_keys]
+
+def get_position_counts():
+    all_positions = get_strategy_positions()
+    auto_positions = get_auto_strategy_positions()
+    manual_count = max(0, len(all_positions) - len(auto_positions))
+    return all_positions, auto_positions, manual_count
 
 def get_strategy_balance():
     return DRY_RUN_BALANCE if DRY_RUN else get_balance()
@@ -150,7 +258,7 @@ def get_strategy_balance():
 def get_trade_summary():
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("SELECT * FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at DESC")
+        cur = conn.execute("SELECT * FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' ORDER BY closed_at DESC")
         rows = cur.fetchall()
         conn.close()
         if not rows: return None
@@ -171,7 +279,13 @@ def get_today_pnl():
     try:
         conn = sqlite3.connect(DB_PATH)
         today = datetime.now().strftime("%Y-%m-%d")
-        cur = conn.execute("SELECT SUM(pnl) FROM trades WHERE closed_at LIKE ? AND pnl IS NOT NULL", (f"{today}%",))
+        max_age_days = STALE_OPEN_TRADE_HOURS / 24.0
+        cur = conn.execute("""SELECT SUM(pnl) FROM trades
+            WHERE closed_at LIKE ?
+              AND pnl IS NOT NULL
+              AND action NOT LIKE 'STALE_%'
+              AND (opened_at LIKE ? OR julianday(closed_at) - julianday(opened_at) <= ?)""",
+            (f"{today}%", f"{today}%", max_age_days))
         result = cur.fetchone()[0]
         conn.close()
         return result if result else 0.0
@@ -212,7 +326,7 @@ def calculate_net_pnl(entry_price, exit_price, size, hold_side):
 def get_pair_performance(symbol):
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), AVG(pnl) FROM trades WHERE symbol=? AND closed_at IS NOT NULL", (symbol,))
+        cur = conn.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), AVG(pnl) FROM trades WHERE symbol=? AND closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'", (symbol,))
         row = cur.fetchone()
         conn.close()
         if not row or row[0] == 0: return None
@@ -224,7 +338,7 @@ def get_pair_performance(symbol):
 def get_direction_performance():
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("SELECT action, pnl FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 100")
+        cur = conn.execute("SELECT action, pnl FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' ORDER BY closed_at DESC LIMIT 100")
         rows = cur.fetchall()
         conn.close()
         stats = {"LONG": {"total": 0, "wins": 0, "pnl": 0.0}, "SHORT": {"total": 0, "wins": 0, "pnl": 0.0}}
@@ -232,6 +346,8 @@ def get_direction_performance():
             direction = str(action).upper()
             if direction.startswith("DRY_"):
                 direction = direction[4:]
+            if direction.startswith("MANUAL_"):
+                direction = direction[7:]
             if direction not in stats:
                 continue
             pnl = parse_float(pnl, 0.0)
@@ -248,10 +364,49 @@ def get_direction_performance():
         return {"LONG": {"total": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0},
                 "SHORT": {"total": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0}}
 
+def get_recent_direction_performance(limit=RECENT_TRADE_LIMIT):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("SELECT action, pnl FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' ORDER BY closed_at DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        conn.close()
+        stats = {"LONG": {"total": 0, "wins": 0, "pnl": 0.0}, "SHORT": {"total": 0, "wins": 0, "pnl": 0.0}}
+        for action, pnl in rows:
+            direction = str(action).upper()
+            if direction.startswith("DRY_"):
+                direction = direction[4:]
+            if direction.startswith("MANUAL_"):
+                direction = direction[7:]
+            if direction not in stats:
+                continue
+            pnl = parse_float(pnl, 0.0)
+            stats[direction]["total"] += 1
+            stats[direction]["pnl"] += pnl
+            if pnl > 0:
+                stats[direction]["wins"] += 1
+        for direction in stats:
+            total = stats[direction]["total"]
+            stats[direction]["win_rate"] = (stats[direction]["wins"] / total * 100) if total else 0.0
+            stats[direction]["avg_pnl"] = (stats[direction]["pnl"] / total) if total else 0.0
+        return stats
+    except:
+        return {"LONG": {"total": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0},
+                "SHORT": {"total": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0}}
+
+def direction_allowed(direction):
+    direction = str(direction).upper()
+    if direction not in ("LONG", "SHORT"):
+        return False
+    stats = get_recent_direction_performance()
+    d = stats[direction]
+    if AUTO_BLOCK_LONG and direction == "LONG":
+        return d["total"] >= DIRECTION_MIN_TRADES and d["win_rate"] >= DIRECTION_MIN_WIN_RATE and d["avg_pnl"] > 0
+    return True
+
 def get_learning_context():
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("SELECT symbol, action, pnl, confidence FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 20")
+        cur = conn.execute("SELECT symbol, action, pnl, confidence FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' ORDER BY closed_at DESC LIMIT 20")
         rows = cur.fetchall()
         conn.close()
         if not rows: return "No trade history yet."
@@ -269,10 +424,17 @@ def get_learning_context():
             best = sorted(winning_pairs.items(), key=lambda x: x[1], reverse=True)[:3]
             context += f"Pairs with most wins: {', '.join([f'{p[0]} ({p[1]}x)' for p in best])}\n"
         direction_stats = get_direction_performance()
-        context += "\nDirectional performance:\n"
+        recent_direction_stats = get_recent_direction_performance()
+        context += "\nDirectional performance (all tracked):\n"
         for direction in ("LONG", "SHORT"):
             d = direction_stats[direction]
             context += f"- {direction}: Win rate {d['win_rate']:.1f}% | Avg PnL: {d['avg_pnl']:.4f} USDT | Trades: {d['total']}\n"
+        context += f"\nRecent directional performance (last {RECENT_TRADE_LIMIT} closed trades):\n"
+        for direction in ("LONG", "SHORT"):
+            d = recent_direction_stats[direction]
+            context += f"- {direction}: Win rate {d['win_rate']:.1f}% | Avg PnL: {d['avg_pnl']:.4f} USDT | Trades: {d['total']}\n"
+        if AUTO_BLOCK_LONG:
+            context += "\nAuto LONG entries are disabled until recent LONG performance becomes positive.\n"
         context += f"\nLast 5 trades:\n"
         for row in rows[:5]:
             symbol, action, pnl, conf = row
@@ -286,7 +448,7 @@ def update_blacklist():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.execute("""SELECT symbol, COUNT(*) as total, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses
-            FROM trades WHERE closed_at IS NOT NULL GROUP BY symbol HAVING total >= 5""")
+            FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' GROUP BY symbol HAVING total >= 5""")
         rows = cur.fetchall()
         conn.close()
         blacklisted_pairs.clear()
@@ -418,22 +580,45 @@ def get_telegram_updates():
     except: return []
 
 def ask_llm(prompt):
-    try:
-        r = requests.post(f"{NVIDIA_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
-            json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=30)
-        try:
-            data = r.json()
-        except Exception:
-            logger.error(f"LLM error: HTTP {r.status_code} body: {r.text}")
-            return None
-        if "choices" not in data:
-            logger.error(f"LLM error: HTTP {r.status_code} body: {r.text}")
-            return None
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error(f"LLM error: {e}")
+    global llm_cooldown_until, LLM_MODEL
+    if time.time() < llm_cooldown_until:
+        logger.warning("LLM cooldown active; skipping this analysis cycle")
         return None
+    models = []
+    for model in [LLM_MODEL] + LLM_FALLBACK_MODELS:
+        if model not in models:
+            models.append(model)
+    temporary_failures = 0
+    for model in models:
+        try:
+            r = requests.post(f"{NVIDIA_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+            try:
+                data = r.json()
+            except Exception:
+                logger.error(f"LLM error on {model}: HTTP {r.status_code} body: {r.text}")
+                if r.status_code == 429 or r.status_code >= 500:
+                    temporary_failures += 1
+                    continue
+                continue
+            if "choices" not in data:
+                logger.error(f"LLM error on {model}: HTTP {r.status_code} body: {r.text}")
+                if r.status_code == 429 or r.status_code >= 500:
+                    temporary_failures += 1
+                    continue
+                continue
+            if model != LLM_MODEL:
+                logger.info(f"LLM fallback working: {model}")
+                LLM_MODEL = model
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"LLM error on {model}: {e}")
+            temporary_failures += 1
+            continue
+    if temporary_failures >= len(models):
+        llm_cooldown_until = time.time() + LLM_ERROR_COOLDOWN_SECONDS
+    return None
 
 def parse_float(value, default=0.0):
     try:
@@ -452,6 +637,35 @@ def parse_int(value, default=0):
 def parse_bool(value):
     if isinstance(value, bool): return value
     return str(value).strip().lower() in ["true", "yes", "1", "open"]
+
+def analyze_top_signals_fallback(tickers, balance):
+    signals = []
+    for rank, t in enumerate(tickers[:TOP_SIGNAL_COUNT], start=1):
+        symbol = t.get("symbol")
+        price = parse_float(t.get("lastPr"), 0.0)
+        chg_pct = parse_float(t.get("changeUtc24h", t.get("priceChangePercent", t.get("change24h", 0.0))), 0.0)
+        if not symbol or price <= 0:
+            continue
+        direction = "SHORT" if AUTO_BLOCK_LONG or chg_pct < 0 else "LONG"
+        confidence = MIN_CONFIDENCE + 2 if rank <= MAX_ORDERS_PER_CYCLE else max(50, MIN_CONFIDENCE - rank)
+        leverage = LOW_CONFIDENCE_MAX_LEVERAGE
+        margin = min(balance * MAX_MARGIN_PER_TRADE_FRACTION, max(0.0, balance - MIN_FREE_BALANCE_USDT))
+        margin = max(0.0, margin)
+        size = normalize_order_size((margin * leverage) / price) if margin > 0 else 0.0
+        signals.append({
+            "rank": rank,
+            "symbol": symbol,
+            "direction": direction,
+            "confidence": confidence,
+            "leverage": leverage,
+            "margin_usdt": margin,
+            "size": size,
+            "possible": margin > 0 and size * price >= MIN_NOTIONAL,
+            "open": rank <= MAX_ORDERS_PER_CYCLE and confidence >= MIN_CONFIDENCE,
+            "reason": "Fallback momentum signal because NVIDIA LLM did not return a usable response.",
+            "price": price,
+        })
+    return signals
 
 def analyze_top_signals(tickers, balance):
     market_rows = []
@@ -496,7 +710,9 @@ Respond ONLY valid JSON:
 ]
 """
     response = ask_llm(prompt)
-    if not response: return []
+    if not response:
+        logger.warning("Using fallback signal ranking because LLM returned no response")
+        return analyze_top_signals_fallback(tickers, balance)
     try:
         start, end = response.find("["), response.rfind("]")
         if start == -1 or end == -1: return []
@@ -586,6 +802,60 @@ def calculate_position_size(balance, signal, entry_price):
     if margin <= 0 or margin > balance or size <= 0:
         return 0.0, 0.0, leverage
     return normalize_order_size(size), margin, leverage
+
+def open_manual_trade(symbol, direction, margin_usdt=0.0, leverage=0):
+    symbol = symbol.upper()
+    direction = direction.upper()
+    if direction not in ("LONG", "SHORT"):
+        send_telegram("⚠️ Manual direction must be LONG or SHORT.")
+        return
+    ticker = next((t for t in get_tickers() if t.get("symbol") == symbol), None)
+    if not ticker:
+        send_telegram(f"⚠️ Symbol not found: {symbol}")
+        return
+    price = parse_float(ticker.get("lastPr"), 0.0)
+    balance = get_strategy_balance()
+    signal = {
+        "confidence": 100,
+        "leverage": leverage if leverage > 0 else RISK_MAX_LEVERAGE,
+        "margin_usdt": margin_usdt,
+        "size": 0.0,
+    }
+    size, margin, leverage = calculate_position_size(balance, signal, price)
+    notional = size * price
+    if price <= 0 or size <= 0 or margin <= 0 or notional < MIN_NOTIONAL:
+        send_telegram(f"⚠️ Cannot open manual {direction} {symbol} with balance {balance:.4f} USDT.")
+        return
+    hold_side = "long" if direction == "LONG" else "short"
+    side = "buy" if direction == "LONG" else "sell"
+    tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage)
+    if DRY_RUN:
+        save_trade_open(symbol, f"DRY_MANUAL_{direction}", price, size, leverage, 100)
+        send_telegram(
+            f"🧪 <b>DRY RUN MANUAL {direction} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
+            f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
+            f"Leverage: <b>{leverage}x</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b> @ <b>{tp_price}</b>\n"
+            f"SL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b> @ <b>{sl_price}</b>\n\nManual trades do not use the auto {MAX_POSITIONS}-pair limit."
+        )
+        logger.info(f"DRY RUN manual opened {direction} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
+        return
+    lev_res = set_leverage(symbol, leverage, hold_side)
+    if lev_res.get("code") != "00000":
+        send_telegram(f"⚠️ Manual leverage failed for {symbol}: {lev_res.get('msg')}")
+        return
+    res = place_order(symbol, side, size, hold_side, tp_price, sl_price)
+    if res.get("code") == "00000":
+        save_trade_open(symbol, f"MANUAL_{direction}", price, size, leverage, 100)
+        send_telegram(
+            f"🟢 <b>MANUAL {direction} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
+            f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
+            f"Leverage: <b>{leverage}x</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b> @ <b>{tp_price}</b>\n"
+            f"SL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b> @ <b>{sl_price}</b>\n\nManual trades do not use the auto {MAX_POSITIONS}-pair limit."
+        )
+        logger.info(f"Manual opened {direction} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
+    else:
+        send_telegram(f"⚠️ Manual order failed for {symbol}: {res.get('msg')}")
+        logger.error(f"Manual order failed for {symbol}: {res.get('msg')}")
 
 def calculate_roi_prices(entry_price, hold_side, leverage):
     price_move_tp = TAKE_PROFIT_ROI_PCT / (leverage * 100)
@@ -710,15 +980,16 @@ def estimate_position_net_pnl(position, current_price=None):
     return net_pnl, fee, size, current_price, entry_price
 
 def find_and_trade():
-    global last_trade_time, force_trade, daily_profit_locked
-    positions = get_strategy_positions()
+    global last_trade_time, force_trade, daily_loss_locked_date
+    positions = get_auto_strategy_positions()
     balance = get_strategy_balance()
     today_net_pnl = get_strategy_today_net_pnl()
-    if today_net_pnl >= DAILY_NET_PROFIT_TARGET_USD:
-        if not daily_profit_locked:
-            send_telegram(f"✅ <b>Daily net target reached</b>\nNet PnL: <b>{today_net_pnl:.4f} USDT</b>\nTarget: <b>{DAILY_NET_PROFIT_TARGET_USD:.4f} USDT</b>\nNew entries paused until next restart/day.")
-            daily_profit_locked = True
-        logger.info(f"Daily net profit target reached: {today_net_pnl:.4f}/{DAILY_NET_PROFIT_TARGET_USD:.4f}; entries paused")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if today_net_pnl <= -MAX_DAILY_LOSS_USD:
+        if daily_loss_locked_date != today:
+            send_telegram(f"🛑 <b>Daily loss limit reached</b>\nNet PnL: <b>{today_net_pnl:.4f} USDT</b>\nLimit: <b>-{MAX_DAILY_LOSS_USD:.4f} USDT</b>\nNew entries paused for today.")
+            daily_loss_locked_date = today
+        logger.info(f"Daily loss limit reached: {today_net_pnl:.4f}/-{MAX_DAILY_LOSS_USD:.4f}; entries paused")
         force_trade = False
         return
     if DRY_RUN:
@@ -754,6 +1025,9 @@ def find_and_trade():
         if opened >= max_to_open: break
         symbol = signal["symbol"]
         if symbol in existing_symbols: continue
+        if not direction_allowed(signal["direction"]):
+            logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance")
+            continue
         if signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]: continue
         price = parse_float(ticker_map.get(symbol, {}).get("lastPr"), signal.get("price", 0.0))
         size, margin, leverage = calculate_position_size(balance, signal, price)
@@ -853,12 +1127,13 @@ def handle_commands():
                 msg, chat_id, text = u.get("message", {}), str(u.get("message", {}).get("chat", {}).get("id", "")), u.get("message", {}).get("text", "").strip().lower()
                 if chat_id not in TELEGRAM_CHAT_IDS: continue
                 if text == "/status":
-                    positions, balance, daily_pnl = get_strategy_positions(), get_strategy_balance(), get_strategy_today_net_pnl()
+                    positions, auto_positions, manual_count = get_position_counts()
+                    balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
                     mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
                     if not positions:
-                        send_telegram(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nPositions: <b>0/{MAX_POSITIONS}</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
+                        send_telegram(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
                     else:
-                        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nPositions: <b>{len(positions)}/{MAX_POSITIONS}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
+                        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
                         for p in positions:
                             entry = float(p.get("openPriceAvg", 0))
                             if DRY_RUN:
@@ -905,6 +1180,16 @@ def handle_commands():
                             logger.info(f"Trade mode changed to {TRADE_MODE.upper()}")
                         else:
                             send_telegram("⚠️ Gagal mengubah mode.")
+                elif text.startswith("/long") or text.startswith("/short"):
+                    parts = text.split()
+                    direction = "LONG" if text.startswith("/long") else "SHORT"
+                    if len(parts) < 2:
+                        send_telegram(f"⚠️ Use /{direction.lower()} SYMBOL [margin_usdt] [leverage]\nExample: /{direction.lower()} BTCUSDT 2 8")
+                        continue
+                    symbol = parts[1].upper()
+                    margin = parse_float(parts[2], 0.0) if len(parts) >= 3 else 0.0
+                    leverage = parse_int(parts[3], 0) if len(parts) >= 4 else 0
+                    open_manual_trade(symbol, direction, margin, leverage)
                 elif text.startswith("/close"):
                     parts = text.split()
                     if len(parts) == 1:
@@ -933,7 +1218,7 @@ def handle_commands():
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
                 elif text == "/help":
-                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now\n/mode [normal|scalping] — switch trading mode\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nMax positions: {MAX_POSITIONS}\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nMax daily loss: ${MAX_DAILY_LOSS_USD}")
+                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now\n/mode [normal|scalping] — switch trading mode\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nMax daily loss: ${MAX_DAILY_LOSS_USD}")
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
@@ -944,14 +1229,15 @@ def main():
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
     send_telegram(f"🤖 <b>Bitget LLM Bot V2</b>\n🧠 <b>Learning Edition</b>\n\nMode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nMax positions: <b>{MAX_POSITIONS}</b>\nScan: <b>{SIGNAL_SCAN_COUNT} tickers / {SLEEP_MINUTES} min</b>\nTop signals: <b>{TOP_SIGNAL_COUNT}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b>\nSL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b>\nMin confidence: <b>{MIN_CONFIDENCE}%</b>\n\nType /help for commands.")
     init_db()
+    cleanup_stale_dry_run_positions()
     t = threading.Thread(target=handle_commands, daemon=True)
     t.start()
     while bot_running:
         try:
-            positions = get_strategy_positions()
+            positions, auto_positions, manual_count = get_position_counts()
             balance = get_strategy_balance()
             real_balance = get_balance() if DRY_RUN else balance
-            logger.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()} | Paper balance: {balance:.4f} | Real balance: {real_balance:.4f} | Positions: {len(positions)}/{MAX_POSITIONS}")
+            logger.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()} | Paper balance: {balance:.4f} | Real balance: {real_balance:.4f} | Auto positions: {len(auto_positions)}/{MAX_POSITIONS} | Manual positions: {manual_count}")
             if positions:
                 for p in positions:
                     if DRY_RUN:
