@@ -31,9 +31,10 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-3.3-70b-instruct")
 LLM_FALLBACK_MODELS = [
     "meta/llama-3.3-70b-instruct",
-    "moonshotai/kimi-k2.6",
-    "deepseek-ai/deepseek-v4-flash",
-    "qwen/qwen3-next-80b-a3b-instruct",
+    "meta/llama-3.1-70b-instruct",
+    "mistralai/mistral-small-24b-instruct",
+    "nvidia/llama-3.1-nemotron-70b-instruct",
+    "qwen/qwen2.5-7b-instruct",
 ]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -50,6 +51,10 @@ DIRECTION_MIN_TRADES = 5
 DIRECTION_BLOCK_WIN_RATE = 25.0
 DIRECTION_BLOCK_AVG_PNL = -0.10
 STALE_OPEN_TRADE_HOURS = 24
+MAX_HOLD_HOURS = 6
+CONSECUTIVE_LOSS_COOLDOWN_MIN = 60
+BLACKLIST_MIN_TRADES = 5
+BLACKLIST_LOSS_RATE_PCT = 70.0
 
 MIN_NOTIONAL = 5.5
 MIN_LEVERAGE, MAX_LEVERAGE = 1, 125
@@ -64,7 +69,7 @@ SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
 
 MAX_POSITIONS, MAX_ORDERS_PER_CYCLE = 2, 2
 TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
-MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.30, 10
+MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.75, 10
 TRAILING_STOP_PCT, MIN_CONFIDENCE = (1.5, 72) if TRADE_MODE == "scalping" else (3.0, 70)
 CONSECUTIVE_LOSS_LIMIT = 3
 TIMEFRAMES = ["15m", "1H", "4H"]
@@ -75,6 +80,7 @@ bot_running, force_trade, last_update_id = True, False, 0
 last_trade_time, daily_pnl = 0, 0.0
 trailing_stops, consecutive_losses, blacklisted_pairs = {}, 0, set()
 llm_cooldown_until, daily_loss_locked_date = 0, None
+consecutive_loss_cooldown_until = 0
 
 TRADE_PROFILES = {
     "normal": {
@@ -215,15 +221,41 @@ def direction_from_action(action):
 def get_dry_run_positions():
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence
+        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence, opened_at
             FROM trades WHERE closed_at IS NULL AND action IN ('DRY_LONG', 'DRY_SHORT', 'DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT')""")
         rows = cur.fetchall()
         conn.close()
         return [{"id": r[0], "symbol": r[1], "action": r[2], "openPriceAvg": r[3],
-                 "size": r[4], "leverage": r[5], "confidence": r[6],
+                 "size": r[4], "leverage": r[5], "confidence": r[6], "opened_at": r[7],
                  "holdSide": direction_from_action(r[2])} for r in rows]
     except:
         return []
+
+def get_open_trade_opened_at(symbol, hold_side):
+    """Look up opened_at for a still-open trade by symbol + side (LIVE path)."""
+    try:
+        direction = str(hold_side).upper()
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("""SELECT opened_at FROM trades
+            WHERE symbol=? AND closed_at IS NULL AND UPPER(action) LIKE ?
+            ORDER BY id DESC LIMIT 1""", (symbol, f"%{direction}%"))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except:
+        return None
+
+def position_age_hours(position):
+    opened_at = position.get("opened_at")
+    if not opened_at and not DRY_RUN:
+        opened_at = get_open_trade_opened_at(position.get("symbol", ""), position.get("holdSide", "long"))
+    if not opened_at:
+        return 0.0
+    try:
+        opened_dt = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return 0.0
+    return (datetime.now() - opened_dt).total_seconds() / 3600
 
 def get_strategy_positions():
     return get_dry_run_positions() if DRY_RUN else get_positions()
@@ -458,17 +490,25 @@ def update_blacklist():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.execute("""SELECT symbol, COUNT(*) as total, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses
-            FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' GROUP BY symbol HAVING total >= 5""")
+            FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' GROUP BY symbol HAVING total >= ?""",
+            (BLACKLIST_MIN_TRADES,))
         rows = cur.fetchall()
         conn.close()
-        blacklisted_pairs.clear()
+        new_blacklist = set()
         for row in rows:
             symbol, total, losses = row
             loss_rate = (losses / total) * 100
-            if loss_rate > 70:
-                blacklisted_pairs.add(symbol)
-                logger.warning(f"Blacklisted {symbol} (loss rate: {loss_rate:.1f}%)")
-    except: pass
+            if loss_rate >= BLACKLIST_LOSS_RATE_PCT:
+                new_blacklist.add(symbol)
+        added = new_blacklist - blacklisted_pairs
+        removed = blacklisted_pairs - new_blacklist
+        for symbol in added:
+            logger.warning(f"Blacklisted {symbol} (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}%)")
+        for symbol in removed:
+            logger.info(f"Removed {symbol} from blacklist (loss rate improved)")
+        blacklisted_pairs = new_blacklist
+    except Exception as e:
+        logger.error(f"update_blacklist error: {e}")
 
 def sign(method, path, body=""):
     ts = str(int(time.time() * 1000))
@@ -598,35 +638,38 @@ def ask_llm(prompt):
     for model in [LLM_MODEL] + LLM_FALLBACK_MODELS:
         if model not in models:
             models.append(model)
-    temporary_failures = 0
+    network_failures = 0
     for model in models:
         try:
             r = requests.post(f"{NVIDIA_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
                 json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+            status = r.status_code
             try:
                 data = r.json()
             except Exception:
-                logger.error(f"LLM error on {model}: HTTP {r.status_code} body: {r.text}")
-                if r.status_code == 429 or r.status_code >= 500:
-                    temporary_failures += 1
-                    continue
-                continue
-            if "choices" not in data:
-                logger.error(f"LLM error on {model}: HTTP {r.status_code} body: {r.text}")
-                if r.status_code == 429 or r.status_code >= 500:
-                    temporary_failures += 1
-                    continue
-                continue
-            if model != LLM_MODEL:
-                logger.info(f"LLM fallback working: {model}")
-                LLM_MODEL = model
-            return data["choices"][0]["message"]["content"].strip()
+                data = None
+            if data and "choices" in data:
+                if model != LLM_MODEL:
+                    logger.info(f"LLM fallback working: {model}")
+                    LLM_MODEL = model
+                return data["choices"][0]["message"]["content"].strip()
+            logger.error(f"LLM error on {model}: HTTP {status} body: {r.text[:300]}")
+            # 4xx (other than 429) = model/auth issue -> try next model without counting as network failure
+            if status == 429 or status >= 500:
+                network_failures += 1
+            continue
+        except requests.exceptions.Timeout:
+            logger.error(f"LLM timeout on {model}")
+            network_failures += 1
+            continue
         except Exception as e:
             logger.error(f"LLM error on {model}: {e}")
-            temporary_failures += 1
+            network_failures += 1
             continue
-    if temporary_failures >= len(models):
+    # Only enter cooldown when network/server is the problem, not when every
+    # model returns 4xx (which would just be config error).
+    if network_failures >= len(models):
         llm_cooldown_until = time.time() + LLM_ERROR_COOLDOWN_SECONDS
     return None
 
@@ -993,7 +1036,7 @@ def estimate_position_net_pnl(position, current_price=None):
     return net_pnl, fee, size, current_price, entry_price
 
 def find_and_trade():
-    global last_trade_time, force_trade, daily_loss_locked_date
+    global last_trade_time, force_trade, daily_loss_locked_date, consecutive_loss_cooldown_until
     positions = get_auto_strategy_positions()
     balance = get_strategy_balance()
     today_net_pnl = get_strategy_today_net_pnl()
@@ -1003,6 +1046,11 @@ def find_and_trade():
             send_telegram(f"🛑 <b>Daily loss limit reached</b>\nNet PnL: <b>{today_net_pnl:.4f} USDT</b>\nLimit: <b>-{MAX_DAILY_LOSS_USD:.4f} USDT</b>\nNew entries paused for today.")
             daily_loss_locked_date = today
         logger.info(f"Daily loss limit reached: {today_net_pnl:.4f}/-{MAX_DAILY_LOSS_USD:.4f}; entries paused")
+        force_trade = False
+        return
+    if time.time() < consecutive_loss_cooldown_until:
+        remaining = int((consecutive_loss_cooldown_until - time.time()) / 60) + 1
+        logger.info(f"Consecutive loss cooldown active ({remaining} min left); skipping new entries")
         force_trade = False
         return
     if DRY_RUN:
@@ -1016,6 +1064,7 @@ def find_and_trade():
         force_trade = False
         return
     logger.info(f"Analyzing {len(candidates)} tickers...")
+    update_blacklist()
     signals = analyze_top_signals(candidates, balance)
     send_top_signals(signals, balance, len(positions))
     force_trade = False
@@ -1038,6 +1087,9 @@ def find_and_trade():
         if opened >= max_to_open: break
         symbol = signal["symbol"]
         if symbol in existing_symbols: continue
+        if symbol in blacklisted_pairs:
+            logger.info(f"Skipping {symbol} - blacklisted (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}%)")
+            continue
         if not direction_allowed(signal["direction"]):
             logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance")
             continue
@@ -1090,7 +1142,7 @@ def find_and_trade():
         logger.info("No orders opened this cycle")
 
 def manage_positions():
-    global consecutive_losses
+    global consecutive_losses, consecutive_loss_cooldown_until
     positions = get_strategy_positions()
     if not positions: return
     for p in positions:
@@ -1128,10 +1180,44 @@ def manage_positions():
                 prefix = "DRY RUN " if DRY_RUN else ""
                 send_telegram(f"🛑 <b>{prefix}STOP LOSS</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>\nConsecutive losses: {consecutive_losses}")
                 logger.info(f"{prefix}SL hit {symbol} | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f} | Fee: {fee:.4f}")
+                if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+                    consecutive_loss_cooldown_until = time.time() + CONSECUTIVE_LOSS_COOLDOWN_MIN * 60
+                    send_telegram(f"⏸️ <b>Cooldown</b>\nReached {consecutive_losses} consecutive losses (limit {CONSECUTIVE_LOSS_LIMIT}).\nNew entries paused for <b>{CONSECUTIVE_LOSS_COOLDOWN_MIN} min</b>.")
+                    logger.warning(f"Consecutive loss limit hit ({consecutive_losses}); cooldown {CONSECUTIVE_LOSS_COOLDOWN_MIN} min")
+                    consecutive_losses = 0
+                continue
+        if check_trailing_stop(symbol, roi_pct):
+            res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
+            if res.get("code") == "00000":
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
+                peak = trailing_stops.pop(symbol, roi_pct)
+                if pnl <= 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
+                prefix = "DRY RUN " if DRY_RUN else ""
+                emoji = "🔻" if pnl <= 0 else "✅"
+                send_telegram(f"{emoji} <b>{prefix}TRAILING STOP</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nPeak ROI: <b>+{peak:.2f}%</b> → Now: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+                logger.info(f"{prefix}Trailing stop hit {symbol} | Peak ROI: {peak:.2f}% | Exit ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f}")
+                continue
+        age_hours = position_age_hours(p)
+        if MAX_HOLD_HOURS > 0 and age_hours >= MAX_HOLD_HOURS:
+            res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
+            if res.get("code") == "00000":
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
+                if symbol in trailing_stops: del trailing_stops[symbol]
+                if pnl <= 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
+                prefix = "DRY RUN " if DRY_RUN else ""
+                emoji = "⏱️" if pnl >= 0 else "⏱️🔻"
+                send_telegram(f"{emoji} <b>{prefix}TIME STOP</b>\n{hold_side.upper()} {symbol}\nHeld: <b>{age_hours:.1f}h</b> (limit {MAX_HOLD_HOURS}h)\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+                logger.info(f"{prefix}Time stop {symbol} | Age: {age_hours:.1f}h | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f}")
                 continue
 
 def handle_commands():
-    global bot_running, force_trade, consecutive_losses
+    global bot_running, force_trade, consecutive_losses, consecutive_loss_cooldown_until
     logger.info("Telegram handler started")
     while bot_running:
         try:
@@ -1174,6 +1260,7 @@ def handle_commands():
                 elif text == "/trade":
                     force_trade = True
                     consecutive_losses = 0
+                    consecutive_loss_cooldown_until = 0
                     send_telegram("⚡ Starting analysis...")
                 elif text.startswith("/mode"):
                     parts = text.split()
@@ -1231,7 +1318,7 @@ def handle_commands():
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
                 elif text == "/help":
-                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now\n/mode [normal|scalping] — switch trading mode\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nMax daily loss: ${MAX_DAILY_LOSS_USD}")
+                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now (clears cooldown)\n/mode [normal|scalping] — switch trading mode\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nTrailing: {TRAILING_STOP_PCT:.1f}% drawdown from peak\nTime stop: {MAX_HOLD_HOURS}h max hold\nMax daily loss: ${MAX_DAILY_LOSS_USD}\nConsec. loss limit: {CONSECUTIVE_LOSS_LIMIT} → {CONSECUTIVE_LOSS_COOLDOWN_MIN} min cooldown")
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
