@@ -31,10 +31,10 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-3.3-70b-instruct")
 LLM_FALLBACK_MODELS = [
     "meta/llama-3.3-70b-instruct",
-    "meta/llama-3.1-70b-instruct",
-    "mistralai/mistral-small-24b-instruct",
-    "nvidia/llama-3.1-nemotron-70b-instruct",
-    "qwen/qwen2.5-7b-instruct",
+    "openai/gpt-oss-120b",
+    "mistralai/mistral-nemotron",
+    "openai/gpt-oss-20b",
+    "meta/llama-3.1-8b-instruct",
 ]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -45,7 +45,7 @@ DRY_RUN_POLL_SECONDS = 15
 TRADE_MODE = "scalping"
 TAKER_FEE_RATE = 0.0006
 LLM_ERROR_COOLDOWN_SECONDS = 300
-LLM_REQUEST_TIMEOUT_SECONDS = 20
+LLM_REQUEST_TIMEOUT_SECONDS = 30
 RECENT_TRADE_LIMIT = 20
 DIRECTION_MIN_TRADES = 5
 DIRECTION_BLOCK_WIN_RATE = 25.0
@@ -81,6 +81,7 @@ last_trade_time, daily_pnl = 0, 0.0
 trailing_stops, consecutive_losses, blacklisted_pairs = {}, 0, set()
 llm_cooldown_until, daily_loss_locked_date = 0, None
 consecutive_loss_cooldown_until = 0
+llm_disabled_models = set()
 
 TRADE_PROFILES = {
     "normal": {
@@ -636,8 +637,12 @@ def ask_llm(prompt):
         return None
     models = []
     for model in [LLM_MODEL] + LLM_FALLBACK_MODELS:
-        if model not in models:
-            models.append(model)
+        if model in models or model in llm_disabled_models:
+            continue
+        models.append(model)
+    if not models:
+        logger.error("All LLM models marked unavailable; using fallback ranker")
+        return None
     network_failures = 0
     for model in models:
         try:
@@ -655,8 +660,11 @@ def ask_llm(prompt):
                     LLM_MODEL = model
                 return data["choices"][0]["message"]["content"].strip()
             logger.error(f"LLM error on {model}: HTTP {status} body: {r.text[:300]}")
-            # 4xx (other than 429) = model/auth issue -> try next model without counting as network failure
-            if status == 429 or status >= 500:
+            # 404 = model not in this account -> disable for the rest of the session
+            if status == 404:
+                llm_disabled_models.add(model)
+                logger.warning(f"Disabling {model} for this session (HTTP 404)")
+            elif status == 429 or status >= 500:
                 network_failures += 1
             continue
         except requests.exceptions.Timeout:
