@@ -48,8 +48,14 @@ LLM_ERROR_COOLDOWN_SECONDS = 300
 LLM_REQUEST_TIMEOUT_SECONDS = 30
 RECENT_TRADE_LIMIT = 20
 DIRECTION_MIN_TRADES = 5
-DIRECTION_BLOCK_WIN_RATE = 25.0
-DIRECTION_BLOCK_AVG_PNL = -0.10
+DIRECTION_BLOCK_WIN_RATE = 30.0
+DIRECTION_BLOCK_AVG_PNL = 0.0
+DIRECTION_LOSS_STREAK_LIMIT = 3
+DIRECTION_LOSS_STREAK_COOLDOWN_MIN = 60
+PAIR_RECENT_TRADE_LIMIT = 8
+PAIR_NEGATIVE_EV_THRESHOLD = -0.01
+PAIR_NEGATIVE_EV_MIN_TRADES = 4
+SIGNAL_NOTIF_COOLDOWN_MIN = 60
 STALE_OPEN_TRADE_HOURS = 24
 MAX_HOLD_HOURS = 6
 CONSECUTIVE_LOSS_COOLDOWN_MIN = 60
@@ -84,6 +90,9 @@ trailing_stops, consecutive_losses, blacklisted_pairs = {}, 0, set()
 llm_cooldown_until, daily_loss_locked_date = 0, None
 consecutive_loss_cooldown_until = 0
 llm_disabled_models = set()
+direction_cooldowns = {"LONG": 0, "SHORT": 0}
+last_signal_notif_time = 0
+last_signal_notif_state = None
 
 TRADE_PROFILES = {
     "normal": {
@@ -438,18 +447,80 @@ def direction_allowed(direction):
     direction = str(direction).upper()
     if direction not in ("LONG", "SHORT"):
         return False
+    if time.time() < direction_cooldowns.get(direction, 0):
+        return False
     stats = get_recent_direction_performance()
     d = stats[direction]
-    # Probe phase: not enough sample for this direction yet — let the strategy try
-    # so we can learn from both wins and losses instead of locking ourselves out.
     if d["total"] < DIRECTION_MIN_TRADES:
         return True
-    # Block only when recent data is decisively bad: both win rate AND avg PnL
-    # are below the danger thresholds. A direction with poor win rate but
-    # positive avg PnL (or vice versa) still gets to trade.
-    if d["win_rate"] < DIRECTION_BLOCK_WIN_RATE and d["avg_pnl"] < DIRECTION_BLOCK_AVG_PNL:
+    # Block when recent data is decisively bad: poor win rate AND non-positive
+    # average net PnL. (Avg PnL >= 0 means we're not bleeding even at low WR.)
+    if d["win_rate"] < DIRECTION_BLOCK_WIN_RATE and d["avg_pnl"] <= DIRECTION_BLOCK_AVG_PNL:
         return False
     return True
+
+def evaluate_direction_loss_streak(direction):
+    """If the last N closed trades on this side are all losses, return cooldown reason."""
+    direction = str(direction).upper()
+    if direction not in ("LONG", "SHORT"):
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """SELECT pnl FROM trades
+               WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'
+                 AND UPPER(action) LIKE ?
+               ORDER BY closed_at DESC LIMIT ?""",
+            (f"%{direction}%", DIRECTION_LOSS_STREAK_LIMIT))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return None
+    if len(rows) < DIRECTION_LOSS_STREAK_LIMIT:
+        return None
+    if all(r[0] is not None and r[0] < 0 for r in rows):
+        return f"last {DIRECTION_LOSS_STREAK_LIMIT} {direction} trades all losses"
+    return None
+
+def check_and_apply_loss_streak_cooldowns():
+    """Refresh direction_cooldowns based on the latest closed trades."""
+    now = time.time()
+    for direction in ("LONG", "SHORT"):
+        if now < direction_cooldowns.get(direction, 0):
+            continue  # already cooling
+        reason = evaluate_direction_loss_streak(direction)
+        if reason:
+            direction_cooldowns[direction] = now + DIRECTION_LOSS_STREAK_COOLDOWN_MIN * 60
+            logger.warning(f"{direction} cooldown: {reason}; pausing {DIRECTION_LOSS_STREAK_COOLDOWN_MIN} min")
+            send_telegram(f"⏸️ <b>{direction} cooldown</b>\nReason: {reason}\nPaused for {DIRECTION_LOSS_STREAK_COOLDOWN_MIN} min")
+
+def get_pair_recent_stats(symbol, limit=PAIR_RECENT_TRADE_LIMIT):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """SELECT pnl FROM trades
+               WHERE symbol=? AND closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'
+               ORDER BY closed_at DESC LIMIT ?""", (symbol, limit))
+        rows = [r[0] for r in cur.fetchall() if r[0] is not None]
+        conn.close()
+    except Exception:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    total = len(rows)
+    if total == 0:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    wins = sum(1 for p in rows if p > 0)
+    return {
+        "total": total,
+        "wins": wins,
+        "win_rate": wins / total * 100,
+        "avg_pnl": sum(rows) / total,
+    }
+
+def pair_negative_ev(symbol):
+    s = get_pair_recent_stats(symbol)
+    if s["total"] < PAIR_NEGATIVE_EV_MIN_TRADES:
+        return False, s
+    return s["avg_pnl"] < PAIR_NEGATIVE_EV_THRESHOLD, s
 
 def get_learning_context():
     try:
@@ -483,9 +554,19 @@ def get_learning_context():
             context += f"- {direction}: Win rate {d['win_rate']:.1f}% | Avg PnL: {d['avg_pnl']:.4f} USDT | Trades: {d['total']}\n"
         blocked = [d for d in ("LONG", "SHORT") if not direction_allowed(d)]
         if blocked:
-            context += f"\nCurrently blocked directions (recent win rate < {DIRECTION_BLOCK_WIN_RATE:.0f}% AND avg PnL < {DIRECTION_BLOCK_AVG_PNL:.2f}): {', '.join(blocked)}\n"
+            context += f"\nCurrently blocked directions (recent win rate < {DIRECTION_BLOCK_WIN_RATE:.0f}% AND avg PnL <= {DIRECTION_BLOCK_AVG_PNL:.2f}, OR active loss-streak cooldown): {', '.join(blocked)}\n"
         else:
             context += "\nBoth LONG and SHORT are allowed; pick the side that price action and momentum support.\n"
+        now = time.time()
+        for direction in ("LONG", "SHORT"):
+            cd = direction_cooldowns.get(direction, 0)
+            if cd > now:
+                mins = int((cd - now) / 60) + 1
+                context += f"- {direction} on loss-streak cooldown for ~{mins} more min — do NOT pick this side.\n"
+        context += "\nDecision rules:\n"
+        context += f"- Avoid pairs whose recent avg net PnL < {PAIR_NEGATIVE_EV_THRESHOLD:.3f} USDT over >= {PAIR_NEGATIVE_EV_MIN_TRADES} trades. Round-trip taker fee is ~0.0072 USDT per scalping trade, so anything close to zero net PnL is a fee-eating churn.\n"
+        context += "- Prefer pairs with clearly positive recent avg net PnL on the side you propose.\n"
+        context += "- If neither side has edge in this candidate, output NO_TRADE rather than forcing one.\n"
         context += f"\nLast 5 trades:\n"
         for row in rows[:5]:
             symbol, action, pnl, conf = row
@@ -748,7 +829,12 @@ def analyze_top_signals(tickers, balance):
         volume = parse_float(t.get("baseVolume"))
         if not symbol or price <= 0: continue
         ticker_map[symbol] = t
-        market_rows.append(f"{symbol} | price={price} | volume={volume}")
+        ps = get_pair_recent_stats(symbol)
+        if ps["total"] >= 1:
+            history_tag = f" | hist({ps['total']}): WR {ps['win_rate']:.0f}%, avg {ps['avg_pnl']:+.4f} USDT"
+        else:
+            history_tag = " | hist(0): no prior trades"
+        market_rows.append(f"{symbol} | price={price} | volume={volume}{history_tag}")
     if not market_rows: return []
     style_hint = "scalping" if TRADE_MODE == "scalping" else "normal trading"
     learning_context = get_learning_context()
@@ -761,7 +847,7 @@ This bot is running in {style_hint} mode.
 === LEARNING CONTEXT ===
 {learning_context}
 
-=== TICKERS ===
+=== TICKERS (with recent per-pair history) ===
 {chr(10).join(market_rows)}
 
 Rules:
@@ -772,8 +858,9 @@ Rules:
 5. Use the lowest leverage that can meet Bitget minimum notional about {MIN_NOTIONAL} USDT. Avoid high leverage; unsafe setups above {RISK_MAX_LEVERAGE}x will be rejected.
 6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
 7. Use the learning context to compare LONG and SHORT performance separately. Pick the side that current price action, momentum, and recent results support — neither side is preferred by default.
-8. If one direction has weak win rate AND negative average net PnL in recent trades, require stronger evidence before opening that direction. Otherwise treat both sides as equally valid candidates.
-9. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs.
+8. If one direction has weak win rate AND non-positive average net PnL in recent trades, require stronger evidence before opening that direction. If a direction is on loss-streak cooldown (see context), do NOT open that side.
+9. The per-pair history shown above is net of fees. A pair with avg PnL near zero or negative over multiple trades is a fee-eating churn — only open it if you have a much stronger setup than baseline. Prefer pairs with clearly positive recent avg net PnL on the side you propose.
+10. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade.
 
 Respond ONLY valid JSON:
 [
@@ -817,7 +904,7 @@ Respond ONLY valid JSON:
 
 def send_top_signals(signals, balance, open_count):
     if not signals:
-        send_telegram("📊 <b>Top signals</b>\nNo valid signals returned this cycle.")
+        logger.info("No valid signals returned this cycle.")
         return
     lines = [f"📊 <b>Top {len(signals)} signals</b>\nBalance: <b>{balance:.4f} USDT</b>\nOpen positions: <b>{open_count}/{MAX_POSITIONS}</b>"]
     for s in signals:
@@ -829,6 +916,34 @@ def send_top_signals(signals, balance, open_count):
             f"{s['reason']}"
         )
     send_telegram("\n\n".join(lines))
+
+def _signals_state_key(signals, open_count):
+    """Cheap fingerprint of the current signal set so we only re-notify on real changes."""
+    if not signals:
+        return ("empty", open_count)
+    return (
+        open_count,
+        tuple((s["symbol"], s["direction"], int(s["confidence"]), bool(s["open"])) for s in signals),
+    )
+
+def maybe_send_top_signals(signals, balance, open_count):
+    """Throttled signal notif: notify when state changes OR cooldown elapsed.
+    Stay silent on repeats even if a signal is marked OPEN — the actual
+    trade open notification is what matters; the ranking is just context."""
+    global last_signal_notif_time, last_signal_notif_state
+    now = time.time()
+    state = _signals_state_key(signals, open_count)
+    state_changed = state != last_signal_notif_state
+    cooldown_passed = (now - last_signal_notif_time) >= SIGNAL_NOTIF_COOLDOWN_MIN * 60
+    if not (state_changed or cooldown_passed):
+        return
+    # Skip when positions are full and the signal set hasn't actually changed,
+    # even if the cooldown elapsed — repeating identical signals is just noise.
+    if open_count >= MAX_POSITIONS and not state_changed:
+        return
+    send_top_signals(signals, balance, open_count)
+    last_signal_notif_time = now
+    last_signal_notif_state = state
 
 def normalize_order_size(size):
     if size <= 0: return 0.0
@@ -1082,13 +1197,13 @@ def find_and_trade():
     candidates = sorted(candidates, key=lambda x: parse_float(x.get("baseVolume")), reverse=True)[:SIGNAL_SCAN_COUNT]
     if not candidates:
         logger.info("No candidates found")
-        send_telegram("📊 <b>Top signals</b>\nNo ticker data available this cycle.")
         force_trade = False
         return
     logger.info(f"Analyzing {len(candidates)} tickers...")
     update_blacklist()
+    check_and_apply_loss_streak_cooldowns()
     signals = analyze_top_signals(candidates, balance)
-    send_top_signals(signals, balance, len(positions))
+    maybe_send_top_signals(signals, balance, len(positions))
     force_trade = False
     if len(positions) >= MAX_POSITIONS:
         logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}; signals only")
@@ -1113,7 +1228,11 @@ def find_and_trade():
             logger.info(f"Skipping {symbol} - blacklisted (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}%)")
             continue
         if not direction_allowed(signal["direction"]):
-            logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance")
+            logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance / cooldown")
+            continue
+        bad_ev, ev_stats = pair_negative_ev(symbol)
+        if bad_ev:
+            logger.info(f"Skipping {symbol} - negative EV (last {ev_stats['total']}: avg {ev_stats['avg_pnl']:+.4f} USDT, WR {ev_stats['win_rate']:.0f}%)")
             continue
         if signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]: continue
         price = parse_float(ticker_map.get(symbol, {}).get("lastPr"), signal.get("price", 0.0))
