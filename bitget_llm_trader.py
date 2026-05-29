@@ -743,11 +743,15 @@ def ask_llm(prompt):
                 data = r.json()
             except Exception:
                 data = None
-            if data and "choices" in data:
-                if model != LLM_MODEL:
-                    logger.info(f"LLM fallback working: {model}")
-                    LLM_MODEL = model
-                return data["choices"][0]["message"]["content"].strip()
+            if data and "choices" in data and data["choices"]:
+                content = (data["choices"][0].get("message") or {}).get("content")
+                if content:
+                    if model != LLM_MODEL:
+                        logger.info(f"LLM fallback working: {model}")
+                        LLM_MODEL = model
+                    return content.strip()
+                logger.warning(f"LLM {model} returned empty content; trying next")
+                continue
             logger.error(f"LLM error on {model}: HTTP {status} body: {r.text[:300]}")
             # 404 = model not in this account -> disable for the rest of the session
             if status == 404:
