@@ -91,6 +91,7 @@ llm_cooldown_until, daily_loss_locked_date = 0, None
 consecutive_loss_cooldown_until = 0
 llm_disabled_models = set()
 direction_cooldowns = {"LONG": 0, "SHORT": 0}
+direction_cooldown_loss_streak_snapshot = {"LONG": [], "SHORT": []}
 last_signal_notif_time = 0
 last_signal_notif_state = None
 
@@ -483,16 +484,45 @@ def evaluate_direction_loss_streak(direction):
     return None
 
 def check_and_apply_loss_streak_cooldowns():
-    """Refresh direction_cooldowns based on the latest closed trades."""
+    """Refresh direction_cooldowns based on the latest closed trades.
+
+    Only apply cooldown once per unique loss streak. Track the loss streak
+    snapshot to avoid re-applying cooldown for the same streak after it expires.
+    """
     now = time.time()
     for direction in ("LONG", "SHORT"):
         if now < direction_cooldowns.get(direction, 0):
             continue  # already cooling
+
+        # Get current loss streak
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.execute(
+                """SELECT pnl FROM trades
+                   WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'
+                     AND UPPER(action) LIKE ?
+                   ORDER BY closed_at DESC LIMIT ?""",
+                (f"%{direction}%", DIRECTION_LOSS_STREAK_LIMIT))
+            current_streak = [r[0] for r in cur.fetchall()]
+            conn.close()
+        except Exception:
+            current_streak = []
+
+        # Check if this is the same loss streak we already cooled down for
+        if current_streak == direction_cooldown_loss_streak_snapshot.get(direction, []):
+            continue  # same streak, don't re-apply cooldown
+
+        # Evaluate if current streak warrants cooldown
         reason = evaluate_direction_loss_streak(direction)
         if reason:
+            # New loss streak detected - apply cooldown and save snapshot
             direction_cooldowns[direction] = now + DIRECTION_LOSS_STREAK_COOLDOWN_MIN * 60
+            direction_cooldown_loss_streak_snapshot[direction] = current_streak
             logger.warning(f"{direction} cooldown: {reason}; pausing {DIRECTION_LOSS_STREAK_COOLDOWN_MIN} min")
             send_telegram(f"⏸️ <b>{direction} cooldown</b>\nReason: {reason}\nPaused for {DIRECTION_LOSS_STREAK_COOLDOWN_MIN} min")
+        else:
+            # No loss streak - clear the snapshot so future streaks can trigger
+            direction_cooldown_loss_streak_snapshot[direction] = []
 
 def get_pair_recent_stats(symbol, limit=PAIR_RECENT_TRADE_LIMIT):
     try:
