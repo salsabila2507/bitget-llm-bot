@@ -48,19 +48,24 @@ LLM_ERROR_COOLDOWN_SECONDS = 300
 LLM_REQUEST_TIMEOUT_SECONDS = 30
 RECENT_TRADE_LIMIT = 20
 DIRECTION_MIN_TRADES = 5
-DIRECTION_BLOCK_WIN_RATE = 30.0
+DIRECTION_BLOCK_WIN_RATE = 55.0
 DIRECTION_BLOCK_AVG_PNL = 0.0
 DIRECTION_LOSS_STREAK_LIMIT = 3
 DIRECTION_LOSS_STREAK_COOLDOWN_MIN = 60
-PAIR_RECENT_TRADE_LIMIT = 8
-PAIR_NEGATIVE_EV_THRESHOLD = -0.01
-PAIR_NEGATIVE_EV_MIN_TRADES = 4
+PAIR_RECENT_TRADE_LIMIT = 10
+PAIR_NEGATIVE_EV_THRESHOLD = 0.0
+PAIR_NEGATIVE_EV_MIN_TRADES = 3
+PAIR_LOSS_STREAK_LIMIT = 2
+PAIR_LOSS_STREAK_COOLDOWN_HOURS = 12
+MIN_QUOTE_VOLUME_USDT = 500000.0
+AUTO_OPEN_ON_LLM_FALLBACK = False
 SIGNAL_NOTIF_COOLDOWN_MIN = 60
 STALE_OPEN_TRADE_HOURS = 24
 MAX_HOLD_HOURS = 6
 CONSECUTIVE_LOSS_COOLDOWN_MIN = 60
 BLACKLIST_MIN_TRADES = 5
 BLACKLIST_LOSS_RATE_PCT = 70.0
+BLACKLIST_AVG_PNL_THRESHOLD = -0.02
 
 MIN_NOTIONAL = 5.5
 MIN_LEVERAGE, MAX_LEVERAGE = 1, 125
@@ -73,12 +78,12 @@ MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
 SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
 
-MAX_POSITIONS, MAX_ORDERS_PER_CYCLE = 2, 2
+MAX_POSITIONS, MAX_ORDERS_PER_CYCLE = 1, 1
 TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
 MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.75, 10
-TRAILING_STOP_PCT, MIN_CONFIDENCE = (3.0, 72) if TRADE_MODE == "scalping" else (3.0, 70)
-TRAILING_ACTIVATE_ROI_PCT = 3.0 if TRADE_MODE == "scalping" else 20.0
-MIN_TRAILING_PROFIT_ROI_PCT = 1.5 if TRADE_MODE == "scalping" else 10.0
+TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (3.0, 70)
+TRAILING_ACTIVATE_ROI_PCT = 8.0 if TRADE_MODE == "scalping" else 20.0
+MIN_TRAILING_PROFIT_ROI_PCT = 5.0 if TRADE_MODE == "scalping" else 10.0
 CONSECUTIVE_LOSS_LIMIT = 3
 TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
@@ -109,10 +114,10 @@ TRADE_PROFILES = {
         "sleep_minutes": 5,
         "take_profit_roi_pct": 10.0,
         "stop_loss_roi_pct": 6.0,
-        "trailing_stop_pct": 3.0,
-        "trailing_activate_roi_pct": 3.0,
-        "min_trailing_profit_roi_pct": 1.5,
-        "min_confidence": 72,
+        "trailing_stop_pct": 2.0,
+        "trailing_activate_roi_pct": 8.0,
+        "min_trailing_profit_roi_pct": 5.0,
+        "min_confidence": 80,
     },
 }
 
@@ -546,6 +551,31 @@ def get_pair_recent_stats(symbol, limit=PAIR_RECENT_TRADE_LIMIT):
         "avg_pnl": sum(rows) / total,
     }
 
+def pair_loss_streak_active(symbol):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """SELECT pnl, closed_at FROM trades
+               WHERE symbol=? AND closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'
+               ORDER BY closed_at DESC LIMIT ?""",
+            (symbol, PAIR_LOSS_STREAK_LIMIT))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return False, ""
+    if len(rows) < PAIR_LOSS_STREAK_LIMIT:
+        return False, ""
+    if not all(r[0] is not None and r[0] < 0 for r in rows):
+        return False, ""
+    try:
+        last_closed = datetime.strptime(rows[0][1], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return True, f"last {PAIR_LOSS_STREAK_LIMIT} trades were losses"
+    age_hours = (datetime.now() - last_closed).total_seconds() / 3600
+    if age_hours <= PAIR_LOSS_STREAK_COOLDOWN_HOURS:
+        return True, f"last {PAIR_LOSS_STREAK_LIMIT} trades were losses; cooling {PAIR_LOSS_STREAK_COOLDOWN_HOURS}h"
+    return False, ""
+
 def pair_negative_ev(symbol):
     s = get_pair_recent_stats(symbol)
     if s["total"] < PAIR_NEGATIVE_EV_MIN_TRADES:
@@ -609,21 +639,21 @@ def update_blacklist():
     global blacklisted_pairs
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("""SELECT symbol, COUNT(*) as total, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses
+        cur = conn.execute("""SELECT symbol, COUNT(*) as total, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, AVG(pnl) as avg_pnl
             FROM trades WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%' GROUP BY symbol HAVING total >= ?""",
             (BLACKLIST_MIN_TRADES,))
         rows = cur.fetchall()
         conn.close()
         new_blacklist = set()
         for row in rows:
-            symbol, total, losses = row
+            symbol, total, losses, avg_pnl = row
             loss_rate = (losses / total) * 100
-            if loss_rate >= BLACKLIST_LOSS_RATE_PCT:
+            if loss_rate >= BLACKLIST_LOSS_RATE_PCT or parse_float(avg_pnl, 0.0) <= BLACKLIST_AVG_PNL_THRESHOLD:
                 new_blacklist.add(symbol)
         added = new_blacklist - blacklisted_pairs
         removed = blacklisted_pairs - new_blacklist
         for symbol in added:
-            logger.warning(f"Blacklisted {symbol} (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}%)")
+            logger.warning(f"Blacklisted {symbol} (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}% or avg PnL <= {BLACKLIST_AVG_PNL_THRESHOLD:+.3f})")
         for symbol in removed:
             logger.info(f"Removed {symbol} from blacklist (loss rate improved)")
         blacklisted_pairs = new_blacklist
@@ -822,6 +852,13 @@ def parse_bool(value):
     if isinstance(value, bool): return value
     return str(value).strip().lower() in ["true", "yes", "1", "open"]
 
+def ticker_quote_volume(ticker, price=0.0):
+    for key in ("quoteVolume", "usdtVolume", "quoteVol", "quoteVolume24h", "turnover24h"):
+        volume = parse_float(ticker.get(key), 0.0)
+        if volume > 0:
+            return volume
+    return parse_float(ticker.get("baseVolume"), 0.0) * parse_float(price, 0.0)
+
 def analyze_top_signals_fallback(tickers, balance):
     signals = []
     for rank, t in enumerate(tickers[:TOP_SIGNAL_COUNT], start=1):
@@ -848,8 +885,8 @@ def analyze_top_signals_fallback(tickers, balance):
             "margin_usdt": margin,
             "size": size,
             "possible": margin > 0 and size * price >= MIN_NOTIONAL,
-            "open": rank <= MAX_ORDERS_PER_CYCLE and confidence >= MIN_CONFIDENCE,
-            "reason": "Fallback momentum signal because NVIDIA LLM did not return a usable response.",
+            "open": AUTO_OPEN_ON_LLM_FALLBACK and rank <= MAX_ORDERS_PER_CYCLE and confidence >= MIN_CONFIDENCE,
+            "reason": "Fallback watch-only momentum signal because NVIDIA LLM did not return a usable response.",
             "price": price,
         })
     return signals
@@ -860,22 +897,23 @@ def analyze_top_signals(tickers, balance):
     for t in tickers[:SIGNAL_SCAN_COUNT]:
         symbol = t.get("symbol")
         price = parse_float(t.get("lastPr"))
-        volume = parse_float(t.get("baseVolume"))
+        volume = ticker_quote_volume(t, price)
         if not symbol or price <= 0: continue
+        if volume < MIN_QUOTE_VOLUME_USDT: continue
         ticker_map[symbol] = t
         ps = get_pair_recent_stats(symbol)
         if ps["total"] >= 1:
             history_tag = f" | hist({ps['total']}): WR {ps['win_rate']:.0f}%, avg {ps['avg_pnl']:+.4f} USDT"
         else:
             history_tag = " | hist(0): no prior trades"
-        market_rows.append(f"{symbol} | price={price} | volume={volume}{history_tag}")
+        market_rows.append(f"{symbol} | price={price} | volume_usdt={volume:.0f}{history_tag}")
     if not market_rows: return []
     style_hint = "scalping" if TRADE_MODE == "scalping" else "normal trading"
     learning_context = get_learning_context()
     prompt = f"""You are controlling a Bitget USDT futures bot with about ${balance:.4f} available balance.
 
 Rank these {len(market_rows)} tickers and select the best {TOP_SIGNAL_COUNT} signals.
-From those {TOP_SIGNAL_COUNT}, choose which 1-2 are worth opening now.
+From those {TOP_SIGNAL_COUNT}, choose at most {MAX_ORDERS_PER_CYCLE} that is worth opening now.
 This bot is running in {style_hint} mode.
 
 === LEARNING CONTEXT ===
@@ -893,12 +931,12 @@ Rules:
 6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
 7. Use the learning context to compare LONG and SHORT performance separately. Pick the side that current price action, momentum, and recent results support — neither side is preferred by default.
 8. If one direction has weak win rate AND non-positive average net PnL in recent trades, require stronger evidence before opening that direction. If a direction is on loss-streak cooldown (see context), do NOT open that side.
-9. The per-pair history shown above is net of fees. A pair with avg PnL near zero or negative over multiple trades is a fee-eating churn — only open it if you have a much stronger setup than baseline. Prefer pairs with clearly positive recent avg net PnL on the side you propose.
+9. The per-pair history shown above is net of fees. A pair with avg PnL near zero or negative over multiple trades is a fee-eating churn. Prefer pairs with clearly positive recent avg net PnL on the side you propose.
 10. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade.
 
 Respond ONLY valid JSON:
 [
-  {{"rank":1,"symbol":"BTCUSDT","direction":"LONG","confidence":80,"leverage":50,"margin_usdt":0.15,"size":0.001,"possible":true,"open":true,"reason":"brief"}},
+  {{"rank":1,"symbol":"BTCUSDT","direction":"LONG","confidence":84,"leverage":4,"margin_usdt":1.4,"size":0.00006,"possible":true,"open":true,"reason":"brief"}},
   ...
 ]
 """
@@ -1224,11 +1262,20 @@ def find_and_trade():
         logger.info(f"Consecutive loss cooldown active ({remaining} min left); skipping new entries")
         force_trade = False
         return
+    if not force_trade and last_trade_time and time.time() - last_trade_time < TRADE_COOLDOWN_MIN * 60:
+        remaining = int(((TRADE_COOLDOWN_MIN * 60) - (time.time() - last_trade_time)) / 60) + 1
+        logger.info(f"Trade cooldown active ({remaining} min left); skipping new entries")
+        return
     if DRY_RUN:
         logger.info(f"Dry-run paper balance: {balance:.4f} USDT | Real balance: {get_balance():.4f} USDT")
     tickers = get_tickers()
-    candidates = [t for t in tickers if t.get("symbol") and parse_float(t.get("lastPr")) > 0 and parse_float(t.get("baseVolume")) > 0]
-    candidates = sorted(candidates, key=lambda x: parse_float(x.get("baseVolume")), reverse=True)[:SIGNAL_SCAN_COUNT]
+    candidates = [
+        t for t in tickers
+        if t.get("symbol")
+        and parse_float(t.get("lastPr")) > 0
+        and ticker_quote_volume(t, parse_float(t.get("lastPr"))) >= MIN_QUOTE_VOLUME_USDT
+    ]
+    candidates = sorted(candidates, key=lambda x: ticker_quote_volume(x, parse_float(x.get("lastPr"))), reverse=True)[:SIGNAL_SCAN_COUNT]
     if not candidates:
         logger.info("No candidates found")
         force_trade = False
@@ -1245,13 +1292,7 @@ def find_and_trade():
     ticker_map = {t["symbol"]: t for t in candidates}
     existing_symbols = {p["symbol"] for p in positions}
     preferred = [s for s in signals if s["open"]]
-    fallback = [s for s in signals if not s["open"]]
-    if preferred:
-        order_candidates = preferred + fallback
-    elif DRY_RUN:
-        order_candidates = sorted(fallback, key=lambda s: (-s["confidence"], s["rank"]))
-    else:
-        order_candidates = []
+    order_candidates = preferred
     opened = 0
     max_to_open = min(MAX_ORDERS_PER_CYCLE, MAX_POSITIONS - len(positions))
     for signal in order_candidates:
@@ -1267,6 +1308,10 @@ def find_and_trade():
         bad_ev, ev_stats = pair_negative_ev(symbol)
         if bad_ev:
             logger.info(f"Skipping {symbol} - negative EV (last {ev_stats['total']}: avg {ev_stats['avg_pnl']:+.4f} USDT, WR {ev_stats['win_rate']:.0f}%)")
+            continue
+        loss_streak, loss_streak_reason = pair_loss_streak_active(symbol)
+        if loss_streak:
+            logger.info(f"Skipping {symbol} - pair cooldown ({loss_streak_reason})")
             continue
         if signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]: continue
         price = parse_float(ticker_map.get(symbol, {}).get("lastPr"), signal.get("price", 0.0))
