@@ -1,3 +1,4 @@
+.env
 .runtime.env
 *.log
 __pycache__/

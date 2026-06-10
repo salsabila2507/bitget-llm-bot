@@ -6,7 +6,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
     handlers=[logging.FileHandler('/root/bitget-llm-bot/bitget_bot.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
-def load_runtime_env(path=".runtime.env"):
+def load_runtime_env(path):
     if not os.path.exists(path):
         return
     try:
@@ -16,11 +16,33 @@ def load_runtime_env(path=".runtime.env"):
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip())
+                key, value = key.strip(), value.strip()
+                if not key or value == "":
+                    continue
+                os.environ.setdefault(key, value)
     except Exception as e:
-        logger.error(f"Failed to load runtime env: {e}")
+        logger.error(f"Failed to load runtime env from {path}: {e}")
 
-load_runtime_env()
+for env_path in (".env", ".runtime.env"):
+    load_runtime_env(env_path)
+
+def env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def env_int(name, default):
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return default
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return default
 
 API_KEY = os.environ.get("BITGET_API_KEY", "")
 SECRET_KEY = os.environ.get("BITGET_SECRET_KEY", "")
@@ -39,10 +61,10 @@ LLM_FALLBACK_MODELS = [
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_CHAT_IDS = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if c.strip()}
-DRY_RUN = True
-DRY_RUN_BALANCE = 5.0
-DRY_RUN_POLL_SECONDS = 15
-TRADE_MODE = "scalping"
+DRY_RUN = env_bool("DRY_RUN", env_bool("BITGET_DRY_RUN", True))
+DRY_RUN_BALANCE = env_float("DRY_RUN_BALANCE", 5.0)
+DRY_RUN_POLL_SECONDS = env_int("DRY_RUN_POLL_SECONDS", 15)
+TRADE_MODE = os.environ.get("TRADE_MODE", os.environ.get("BITGET_TRADE_MODE", "scalping")).strip().lower()
 TAKER_FEE_RATE = 0.0006
 LLM_ERROR_COOLDOWN_SECONDS = 300
 LLM_REQUEST_TIMEOUT_SECONDS = 30
@@ -55,6 +77,10 @@ DIRECTION_LOSS_STREAK_COOLDOWN_MIN = 60
 PAIR_RECENT_TRADE_LIMIT = 10
 PAIR_NEGATIVE_EV_THRESHOLD = 0.0
 PAIR_NEGATIVE_EV_MIN_TRADES = 3
+PAIR_DIRECTION_RECENT_TRADE_LIMIT = 8
+PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD = 0.0
+PAIR_DIRECTION_MIN_TRADES = 2
+PAIR_DIRECTION_BLOCK_WIN_RATE = 50.0
 PAIR_LOSS_STREAK_LIMIT = 2
 PAIR_LOSS_STREAK_COOLDOWN_HOURS = 12
 MIN_QUOTE_VOLUME_USDT = 500000.0
@@ -78,7 +104,8 @@ MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
 SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
 
-MAX_POSITIONS, MAX_ORDERS_PER_CYCLE = 1, 1
+MAX_POSITIONS = max(1, env_int("MAX_POSITIONS", env_int("MAX_PAIRS", 2)))
+MAX_ORDERS_PER_CYCLE = max(1, min(MAX_POSITIONS, env_int("MAX_ORDERS_PER_CYCLE", 1)))
 TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
 MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.75, 10
 TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (3.0, 70)
@@ -137,7 +164,9 @@ def apply_trade_mode(mode):
     MIN_CONFIDENCE = profile["min_confidence"]
     return True
 
-apply_trade_mode(TRADE_MODE)
+if not apply_trade_mode(TRADE_MODE):
+    logger.warning(f"Unknown TRADE_MODE={TRADE_MODE}; falling back to scalping")
+    apply_trade_mode("scalping")
 
 def ensure_daemonized():
     if os.environ.get("BITGET_BOT_DAEMON") == "1":
@@ -172,10 +201,27 @@ def save_trade_open(symbol, action, entry_price, size, leverage, confidence):
     conn.commit()
     conn.close()
 
-def save_trade_close(symbol, exit_price, pnl):
+def hold_side_to_direction(hold_side):
+    return "LONG" if str(hold_side).lower() == "long" else "SHORT"
+
+def save_trade_close(symbol, exit_price, pnl, hold_side=None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
-        (exit_price, pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol))
+    closed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if hold_side:
+        direction = hold_side_to_direction(hold_side)
+        cur = conn.execute("""SELECT id FROM trades
+            WHERE symbol=? AND closed_at IS NULL AND UPPER(action) LIKE ?
+            ORDER BY id DESC LIMIT 1""", (symbol, f"%{direction}%"))
+        row = cur.fetchone()
+        if row:
+            conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE id=?",
+                (exit_price, pnl, closed_at, row[0]))
+        else:
+            conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
+                (exit_price, pnl, closed_at, symbol))
+    else:
+        conn.execute("UPDATE trades SET exit_price=?, pnl=?, closed_at=? WHERE symbol=? AND closed_at IS NULL",
+            (exit_price, pnl, closed_at, symbol))
     conn.commit()
     conn.close()
 
@@ -241,6 +287,21 @@ def is_manual_action(action):
 def direction_from_action(action):
     action = str(action).upper()
     return "long" if "LONG" in action else "short"
+
+def action_direction(action):
+    action = str(action).upper()
+    if "LONG" in action:
+        return "LONG"
+    if "SHORT" in action:
+        return "SHORT"
+    return None
+
+def position_state_key(symbol, hold_side):
+    return f"{symbol}:{str(hold_side).lower()}"
+
+def clear_trailing_stop(symbol, hold_side):
+    trailing_stops.pop(position_state_key(symbol, hold_side), None)
+    trailing_stops.pop(symbol, None)
 
 def get_dry_run_positions():
     try:
@@ -399,11 +460,7 @@ def get_direction_performance():
         conn.close()
         stats = {"LONG": {"total": 0, "wins": 0, "pnl": 0.0}, "SHORT": {"total": 0, "wins": 0, "pnl": 0.0}}
         for action, pnl in rows:
-            direction = str(action).upper()
-            if direction.startswith("DRY_"):
-                direction = direction[4:]
-            if direction.startswith("MANUAL_"):
-                direction = direction[7:]
+            direction = action_direction(action)
             if direction not in stats:
                 continue
             pnl = parse_float(pnl, 0.0)
@@ -428,11 +485,7 @@ def get_recent_direction_performance(limit=RECENT_TRADE_LIMIT):
         conn.close()
         stats = {"LONG": {"total": 0, "wins": 0, "pnl": 0.0}, "SHORT": {"total": 0, "wins": 0, "pnl": 0.0}}
         for action, pnl in rows:
-            direction = str(action).upper()
-            if direction.startswith("DRY_"):
-                direction = direction[4:]
-            if direction.startswith("MANUAL_"):
-                direction = direction[7:]
+            direction = action_direction(action)
             if direction not in stats:
                 continue
             pnl = parse_float(pnl, 0.0)
@@ -582,6 +635,43 @@ def pair_negative_ev(symbol):
         return False, s
     return s["avg_pnl"] < PAIR_NEGATIVE_EV_THRESHOLD, s
 
+def get_pair_direction_recent_stats(symbol, direction, limit=PAIR_DIRECTION_RECENT_TRADE_LIMIT):
+    direction = str(direction).upper()
+    if direction not in ("LONG", "SHORT"):
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """SELECT pnl FROM trades
+               WHERE symbol=? AND closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'
+                 AND UPPER(action) LIKE ?
+               ORDER BY closed_at DESC LIMIT ?""",
+            (symbol, f"%{direction}%", limit))
+        rows = [r[0] for r in cur.fetchall() if r[0] is not None]
+        conn.close()
+    except Exception:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    total = len(rows)
+    if total == 0:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    wins = sum(1 for p in rows if p > 0)
+    return {
+        "total": total,
+        "wins": wins,
+        "win_rate": wins / total * 100,
+        "avg_pnl": sum(rows) / total,
+    }
+
+def pair_direction_negative_ev(symbol, direction):
+    s = get_pair_direction_recent_stats(symbol, direction)
+    if s["total"] < PAIR_DIRECTION_MIN_TRADES:
+        return False, s
+    is_bad = (
+        s["avg_pnl"] <= PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD
+        and s["win_rate"] < PAIR_DIRECTION_BLOCK_WIN_RATE
+    )
+    return is_bad, s
+
 def get_learning_context():
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -612,6 +702,34 @@ def get_learning_context():
         for direction in ("LONG", "SHORT"):
             d = recent_direction_stats[direction]
             context += f"- {direction}: Win rate {d['win_rate']:.1f}% | Avg PnL: {d['avg_pnl']:.4f} USDT | Trades: {d['total']}\n"
+        pair_side_stats = defaultdict(lambda: {"total": 0, "wins": 0, "pnl": 0.0})
+        for symbol, action, pnl, conf in rows:
+            direction = action_direction(action)
+            if not direction or pnl is None:
+                continue
+            key = (symbol, direction)
+            pnl = parse_float(pnl, 0.0)
+            pair_side_stats[key]["total"] += 1
+            pair_side_stats[key]["pnl"] += pnl
+            if pnl > 0:
+                pair_side_stats[key]["wins"] += 1
+        pair_side_rows = []
+        for (symbol, direction), s in pair_side_stats.items():
+            if s["total"] < PAIR_DIRECTION_MIN_TRADES:
+                continue
+            s["win_rate"] = s["wins"] / s["total"] * 100
+            s["avg_pnl"] = s["pnl"] / s["total"]
+            pair_side_rows.append((symbol, direction, s))
+        if pair_side_rows:
+            context += "\nRecent pair+direction performance:\n"
+            best_side = sorted(pair_side_rows, key=lambda x: x[2]["avg_pnl"], reverse=True)[:3]
+            worst_side = sorted(pair_side_rows, key=lambda x: x[2]["avg_pnl"])[:3]
+            context += "- Best side setups: " + ", ".join(
+                [f"{symbol} {direction} avg {s['avg_pnl']:+.4f} USDT WR {s['win_rate']:.0f}% ({s['total']}x)" for symbol, direction, s in best_side]
+            ) + "\n"
+            context += "- Weak side setups: " + ", ".join(
+                [f"{symbol} {direction} avg {s['avg_pnl']:+.4f} USDT WR {s['win_rate']:.0f}% ({s['total']}x)" for symbol, direction, s in worst_side]
+            ) + "\n"
         blocked = [d for d in ("LONG", "SHORT") if not direction_allowed(d)]
         if blocked:
             context += f"\nCurrently blocked directions (recent win rate < {DIRECTION_BLOCK_WIN_RATE:.0f}% AND avg PnL <= {DIRECTION_BLOCK_AVG_PNL:.2f}, OR active loss-streak cooldown): {', '.join(blocked)}\n"
@@ -625,8 +743,9 @@ def get_learning_context():
                 context += f"- {direction} on loss-streak cooldown for ~{mins} more min — do NOT pick this side.\n"
         context += "\nDecision rules:\n"
         context += f"- Avoid pairs whose recent avg net PnL < {PAIR_NEGATIVE_EV_THRESHOLD:.3f} USDT over >= {PAIR_NEGATIVE_EV_MIN_TRADES} trades. Round-trip taker fee is ~0.0072 USDT per scalping trade, so anything close to zero net PnL is a fee-eating churn.\n"
+        context += f"- Avoid a specific pair+direction after >= {PAIR_DIRECTION_MIN_TRADES} trades when its avg net PnL <= {PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD:.3f} USDT and win rate < {PAIR_DIRECTION_BLOCK_WIN_RATE:.0f}%.\n"
         context += "- Prefer pairs with clearly positive recent avg net PnL on the side you propose.\n"
-        context += "- If neither side has edge in this candidate, output NO_TRADE rather than forcing one.\n"
+        context += "- If neither side has edge in this candidate, set open:false rather than forcing a trade.\n"
         context += f"\nLast 5 trades:\n"
         for row in rows[:5]:
             symbol, action, pnl, conf = row
@@ -756,7 +875,7 @@ def close_all_positions():
         else:
             res = close_position_api(symbol, hold)
         if res.get("code") == "00000":
-            save_trade_close_by_id(p["id"], price, pnl) if DRY_RUN else save_trade_close(symbol, price, pnl)
+            save_trade_close_by_id(p["id"], price, pnl) if DRY_RUN else save_trade_close(symbol, price, pnl, hold)
             emoji = "✅" if pnl > 0 else "❌"
             prefix = "DRY RUN " if DRY_RUN else ""
             send_telegram(f"{emoji} <b>{prefix}CLOSED</b> {hold.upper()} {symbol}\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
@@ -903,9 +1022,16 @@ def analyze_top_signals(tickers, balance):
         ticker_map[symbol] = t
         ps = get_pair_recent_stats(symbol)
         if ps["total"] >= 1:
-            history_tag = f" | hist({ps['total']}): WR {ps['win_rate']:.0f}%, avg {ps['avg_pnl']:+.4f} USDT"
+            history_tag = f" | pair_hist({ps['total']}): WR {ps['win_rate']:.0f}%, avg {ps['avg_pnl']:+.4f} USDT"
         else:
-            history_tag = " | hist(0): no prior trades"
+            history_tag = " | pair_hist(0): no prior trades"
+        side_tags = []
+        for direction in ("LONG", "SHORT"):
+            ds = get_pair_direction_recent_stats(symbol, direction)
+            if ds["total"] >= 1:
+                side_tags.append(f"{direction}({ds['total']}): WR {ds['win_rate']:.0f}%, avg {ds['avg_pnl']:+.4f}")
+        if side_tags:
+            history_tag += " | side_hist " + " / ".join(side_tags)
         market_rows.append(f"{symbol} | price={price} | volume_usdt={volume:.0f}{history_tag}")
     if not market_rows: return []
     style_hint = "scalping" if TRADE_MODE == "scalping" else "normal trading"
@@ -931,8 +1057,9 @@ Rules:
 6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
 7. Use the learning context to compare LONG and SHORT performance separately. Pick the side that current price action, momentum, and recent results support — neither side is preferred by default.
 8. If one direction has weak win rate AND non-positive average net PnL in recent trades, require stronger evidence before opening that direction. If a direction is on loss-streak cooldown (see context), do NOT open that side.
-9. The per-pair history shown above is net of fees. A pair with avg PnL near zero or negative over multiple trades is a fee-eating churn. Prefer pairs with clearly positive recent avg net PnL on the side you propose.
-10. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade.
+9. The per-pair and side history shown above is net of fees. A pair or specific side with avg PnL near zero or negative over multiple trades is a fee-eating churn.
+10. Prefer pairs with clearly positive recent avg net PnL on the exact LONG/SHORT side you propose.
+11. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade.
 
 Respond ONLY valid JSON:
 [
@@ -1208,16 +1335,16 @@ def calculate_position_roi_pct(position):
 def check_stop_loss(position, entry_price):
     return calculate_position_roi_pct(position) <= -STOP_LOSS_ROI_PCT
 
-def check_trailing_stop(symbol, current_roi_pct):
+def check_trailing_stop(position_key, current_roi_pct):
     # Arm trailing only after the trade clears fees with margin to spare.
-    if symbol not in trailing_stops:
+    if position_key not in trailing_stops:
         if current_roi_pct < TRAILING_ACTIVATE_ROI_PCT:
             return False
-        trailing_stops[symbol] = current_roi_pct
+        trailing_stops[position_key] = current_roi_pct
         return False
-    highest = trailing_stops[symbol]
+    highest = trailing_stops[position_key]
     if current_roi_pct > highest:
-        trailing_stops[symbol] = current_roi_pct
+        trailing_stops[position_key] = current_roi_pct
         return False
     # Never trail-out below the minimum net-profit floor — otherwise we'd
     # just be paying round-trip fees to scratch in and out.
@@ -1305,6 +1432,10 @@ def find_and_trade():
         if not direction_allowed(signal["direction"]):
             logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance / cooldown")
             continue
+        bad_side_ev, side_stats = pair_direction_negative_ev(symbol, signal["direction"])
+        if bad_side_ev:
+            logger.info(f"Skipping {symbol} {signal['direction']} - weak pair+side history (last {side_stats['total']}: avg {side_stats['avg_pnl']:+.4f} USDT, WR {side_stats['win_rate']:.0f}%)")
+            continue
         bad_ev, ev_stats = pair_negative_ev(symbol)
         if bad_ev:
             logger.info(f"Skipping {symbol} - negative EV (last {ev_stats['total']}: avg {ev_stats['avg_pnl']:+.4f} USDT, WR {ev_stats['win_rate']:.0f}%)")
@@ -1367,6 +1498,7 @@ def manage_positions():
     if not positions: return
     for p in positions:
         symbol, hold_side, entry = p["symbol"], p.get("holdSide", "long"), float(p.get("openPriceAvg", 0))
+        trail_key = position_state_key(symbol, hold_side)
         if DRY_RUN:
             ticker = next((t for t in get_tickers() if t.get("symbol") == symbol), {})
             current = parse_float(ticker.get("lastPr"), entry)
@@ -1384,8 +1516,8 @@ def manage_positions():
         if roi_pct >= TAKE_PROFIT_ROI_PCT:
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             if res.get("code") == "00000":
-                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
-                if symbol in trailing_stops: del trailing_stops[symbol]
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
+                clear_trailing_stop(symbol, hold_side)
                 consecutive_losses = 0
                 prefix = "DRY RUN " if DRY_RUN else ""
                 send_telegram(f"✅ <b>{prefix}TAKE PROFIT</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>+{roi_pct:.2f}%</b>\nNet PnL: <b>+{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
@@ -1394,8 +1526,8 @@ def manage_positions():
         if check_stop_loss(p, entry):
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             if res.get("code") == "00000":
-                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
-                if symbol in trailing_stops: del trailing_stops[symbol]
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
+                clear_trailing_stop(symbol, hold_side)
                 consecutive_losses += 1
                 prefix = "DRY RUN " if DRY_RUN else ""
                 send_telegram(f"🛑 <b>{prefix}STOP LOSS</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>\nConsecutive losses: {consecutive_losses}")
@@ -1406,11 +1538,12 @@ def manage_positions():
                     logger.warning(f"Consecutive loss limit hit ({consecutive_losses}); cooldown {CONSECUTIVE_LOSS_COOLDOWN_MIN} min")
                     consecutive_losses = 0
                 continue
-        if check_trailing_stop(symbol, roi_pct):
+        if check_trailing_stop(trail_key, roi_pct):
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             if res.get("code") == "00000":
-                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
-                peak = trailing_stops.pop(symbol, roi_pct)
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
+                peak = trailing_stops.pop(trail_key, roi_pct)
+                trailing_stops.pop(symbol, None)
                 if pnl <= 0:
                     consecutive_losses += 1
                 else:
@@ -1424,8 +1557,8 @@ def manage_positions():
         if MAX_HOLD_HOURS > 0 and age_hours >= MAX_HOLD_HOURS:
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             if res.get("code") == "00000":
-                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl)
-                if symbol in trailing_stops: del trailing_stops[symbol]
+                save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
+                clear_trailing_stop(symbol, hold_side)
                 if pnl <= 0:
                     consecutive_losses += 1
                 else:
@@ -1527,8 +1660,8 @@ def handle_commands():
                             pnl, fee, size, current, entry = estimate_position_net_pnl(pos, price)
                             res = {"code": "00000"} if DRY_RUN else close_position_api(sym, hold)
                             if res.get("code") == "00000":
-                                save_trade_close_by_id(pos["id"], price, pnl) if DRY_RUN else save_trade_close(sym, price, pnl)
-                                if sym in trailing_stops: del trailing_stops[sym]
+                                save_trade_close_by_id(pos["id"], price, pnl) if DRY_RUN else save_trade_close(sym, price, pnl, hold)
+                                clear_trailing_stop(sym, hold)
                                 emoji = "✅" if pnl > 0 else "❌"
                                 prefix = "DRY RUN " if DRY_RUN else ""
                                 send_telegram(f"{emoji} <b>{prefix}CLOSED</b> {hold.upper()} {sym}\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
