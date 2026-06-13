@@ -100,6 +100,7 @@ meta/llama-3.3-70b-instruct
 /balance             paper balance, real balance, daily PnL
 /history             trade stats
 /trade               force a scan now
+/forcetrade          force open 1 pair from top 10 signals, max 2 auto positions
 /mode                show current mode
 /mode scalping       switch to scalping mode
 /mode normal         switch to normal mode

@@ -50,14 +50,23 @@ PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
 BASE_URL = "https://api.bitget.com"
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-3.3-70b-instruct")
+LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-4-maverick-17b-128e-instruct")
+VIRTUALS_API_KEY = os.environ.get("VIRTUALS_API_KEY", "")
+VIRTUALS_BASE_URL = "https://compute.virtuals.io/v1"
+VIRTUALS_MODEL = os.environ.get("VIRTUALS_MODEL", "deepseek-v4-flash")
 LLM_FALLBACK_MODELS = [
+    "deepseek-ai/deepseek-v4-flash",
+    "mistralai/mistral-large-3-675b-instruct-2512",
+    "qwen/qwen3.5-122b-a10b",
     "meta/llama-3.3-70b-instruct",
-    "openai/gpt-oss-120b",
-    "mistralai/mistral-nemotron",
-    "openai/gpt-oss-20b",
-    "meta/llama-3.1-8b-instruct",
 ]
+VIRTUALS_FALLBACK_MODELS = [
+    "gemini-3-flash-preview",
+    "openai-gpt-55",
+    "deepseek-v4-pro",
+    "openai-gpt-55-pro",
+]
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "nvidia").strip().lower()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_CHAT_IDS = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if c.strip()}
@@ -106,6 +115,7 @@ SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
 
 MAX_POSITIONS = max(1, env_int("MAX_POSITIONS", env_int("MAX_PAIRS", 2)))
 MAX_ORDERS_PER_CYCLE = max(1, min(MAX_POSITIONS, env_int("MAX_ORDERS_PER_CYCLE", 1)))
+FORCE_TRADE_ORDERS_PER_COMMAND = 1
 TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
 MAX_DAILY_LOSS_USD, TRADE_COOLDOWN_MIN = 0.75, 10
 TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (3.0, 70)
@@ -116,12 +126,13 @@ TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
 DB_PATH = "/root/trade_history.db"
 
-bot_running, force_trade, last_update_id = True, False, 0
+bot_running, force_trade, force_open_trade, last_update_id = True, False, False, 0
 last_trade_time, daily_pnl = 0, 0.0
 trailing_stops, consecutive_losses, blacklisted_pairs = {}, 0, set()
 llm_cooldown_until, daily_loss_locked_date = 0, None
 consecutive_loss_cooldown_until = 0
 llm_disabled_models = set()
+llm_model_cooldowns = {}  # model -> timestamp until which it's on cooldown
 direction_cooldowns = {"LONG": 0, "SHORT": 0}
 direction_cooldown_loss_streak_snapshot = {"LONG": [], "SHORT": []}
 last_signal_notif_time = 0
@@ -898,59 +909,100 @@ def get_telegram_updates():
         return updates
     except: return []
 
-def ask_llm(prompt):
-    global llm_cooldown_until, LLM_MODEL
-    if time.time() < llm_cooldown_until:
-        logger.warning("LLM cooldown active; skipping this analysis cycle")
-        return None
-    models = []
-    for model in [LLM_MODEL] + LLM_FALLBACK_MODELS:
-        if model in models or model in llm_disabled_models:
-            continue
-        models.append(model)
-    if not models:
-        logger.error("All LLM models marked unavailable; using fallback ranker")
-        return None
+def _try_llm_provider(prompt, base_url, api_key, models):
+    global LLM_MODEL, llm_model_cooldowns
+    now = time.time()
     network_failures = 0
     for model in models:
-        try:
-            r = requests.post(f"{NVIDIA_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
-                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
-            status = r.status_code
+        for attempt in range(2):
             try:
-                data = r.json()
-            except Exception:
-                data = None
-            if data and "choices" in data and data["choices"]:
-                content = (data["choices"][0].get("message") or {}).get("content")
-                if content:
-                    if model != LLM_MODEL:
-                        logger.info(f"LLM fallback working: {model}")
-                        LLM_MODEL = model
-                    return content.strip()
-                logger.warning(f"LLM {model} returned empty content; trying next")
-                continue
-            logger.error(f"LLM error on {model}: HTTP {status} body: {r.text[:300]}")
-            # 404 = model not in this account -> disable for the rest of the session
-            if status == 404:
-                llm_disabled_models.add(model)
-                logger.warning(f"Disabling {model} for this session (HTTP 404)")
-            elif status == 429 or status >= 500:
+                r = requests.post(f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+                status = r.status_code
+                try:
+                    data = r.json()
+                except Exception:
+                    data = None
+                if data and "choices" in data and data["choices"]:
+                    content = (data["choices"][0].get("message") or {}).get("content")
+                    if content:
+                        if model != LLM_MODEL:
+                            logger.info(f"LLM fallback working: {model}")
+                            LLM_MODEL = model
+                        return content.strip()
+                    logger.warning(f"LLM {model} returned empty content; trying next")
+                    break
+                logger.error(f"LLM error on {model}: HTTP {status} body: {r.text[:300]}")
+                if status == 404:
+                    llm_disabled_models.add(model)
+                    logger.warning(f"Disabling {model} for this session (HTTP 404)")
+                    break
+                elif status == 429:
+                    llm_model_cooldowns[model] = time.time() + 60
+                    network_failures += 1
+                    if attempt == 0:
+                        logger.warning(f"LLM {model} rate limited; retrying after 5s")
+                        time.sleep(5)
+                        continue
+                elif status >= 500:
+                    network_failures += 1
+                    if attempt == 0:
+                        logger.warning(f"LLM {model} server error; retrying after 3s")
+                        time.sleep(3)
+                        continue
+                break
+            except requests.exceptions.Timeout:
+                logger.error(f"LLM timeout on {model}")
                 network_failures += 1
+                if attempt == 0:
+                    logger.warning(f"Retrying {model} after timeout")
+                    time.sleep(2)
+                    continue
+                break
+            except Exception as e:
+                logger.error(f"LLM error on {model}: {e}")
+                network_failures += 1
+                if attempt == 0:
+                    logger.warning(f"Retrying {model} after error")
+                    time.sleep(2)
+                    continue
+                break
+    return None
+
+def ask_llm(prompt):
+    global llm_cooldown_until, llm_model_cooldowns, LLM_MODEL
+    now = time.time()
+    if now < llm_cooldown_until:
+        logger.warning("LLM cooldown active; skipping this analysis cycle")
+        return None
+    providers = [
+        ("nvidia", NVIDIA_BASE_URL, NVIDIA_API_KEY, [LLM_MODEL] + LLM_FALLBACK_MODELS),
+        ("virtuals", VIRTUALS_BASE_URL, VIRTUALS_API_KEY, [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS),
+    ]
+    if LLM_PROVIDER == "virtuals":
+        providers.reverse()
+    attempted = False
+    for name, base_url, api_key, model_list in providers:
+        if not api_key:
             continue
-        except requests.exceptions.Timeout:
-            logger.error(f"LLM timeout on {model}")
-            network_failures += 1
+        models = []
+        for model in model_list:
+            if model in models or model in llm_disabled_models:
+                continue
+            if model in llm_model_cooldowns and now < llm_model_cooldowns[model]:
+                continue
+            models.append(model)
+        if not models:
             continue
-        except Exception as e:
-            logger.error(f"LLM error on {model}: {e}")
-            network_failures += 1
-            continue
-    # Only enter cooldown when network/server is the problem, not when every
-    # model returns 4xx (which would just be config error).
-    if network_failures >= len(models):
-        llm_cooldown_until = time.time() + LLM_ERROR_COOLDOWN_SECONDS
+        attempted = True
+        logger.info(f"Trying {name.upper()} provider ({len(models)} model(s))")
+        result = _try_llm_provider(prompt, base_url, api_key, models)
+        if result:
+            return result
+        logger.warning(f"{name.upper()} provider failed; trying next")
+    if attempted:
+        llm_cooldown_until = now + LLM_ERROR_COOLDOWN_SECONDS
     return None
 
 def parse_float(value, default=0.0):
@@ -987,8 +1039,8 @@ def analyze_top_signals_fallback(tickers, balance):
         if not symbol or price <= 0:
             continue
         # Momentum-following fallback: ride the 24h move direction so we can
-        # learn from both sides. The direction_allowed gate downstream will
-        # still skip a side that recent data shows is decisively losing.
+        # learn from both sides. Normal mode can still skip a side downstream
+        # when recent data shows it is decisively losing.
         direction = "LONG" if chg_pct >= 0 else "SHORT"
         confidence = MIN_CONFIDENCE + 2 if rank <= MAX_ORDERS_PER_CYCLE else max(50, MIN_CONFIDENCE - rank)
         leverage = LOW_CONFIDENCE_MAX_LEVERAGE
@@ -1010,7 +1062,7 @@ def analyze_top_signals_fallback(tickers, balance):
         })
     return signals
 
-def analyze_top_signals(tickers, balance):
+def analyze_top_signals(tickers, balance, force_open=False):
     market_rows = []
     ticker_map = {}
     for t in tickers[:SIGNAL_SCAN_COUNT]:
@@ -1036,11 +1088,23 @@ def analyze_top_signals(tickers, balance):
     if not market_rows: return []
     style_hint = "scalping" if TRADE_MODE == "scalping" else "normal trading"
     learning_context = get_learning_context()
+    max_open_signals = FORCE_TRADE_ORDERS_PER_COMMAND if force_open else MAX_ORDERS_PER_CYCLE
+    force_mode_rules = ""
+    if force_open:
+        force_mode_rules = f"""
+
+FORCE TRADE MODE:
+- The user explicitly requested an order. Learning history, blacklist, cooldown, negative EV, and OPEN false preferences are advisory only.
+- Do not avoid a pair or LONG/SHORT side solely because learning context says blocked, weak, blacklisted, or on cooldown.
+- Pick the best current market setup from the ranked list and mark OPEN true for up to {FORCE_TRADE_ORDERS_PER_COMMAND} technically possible candidate.
+- Still keep leverage/order sizing realistic for the available balance and Bitget minimum notional.
+"""
     prompt = f"""You are controlling a Bitget USDT futures bot with about ${balance:.4f} available balance.
 
 Rank these {len(market_rows)} tickers and select the best {TOP_SIGNAL_COUNT} signals.
-From those {TOP_SIGNAL_COUNT}, choose at most {MAX_ORDERS_PER_CYCLE} that is worth opening now.
+From those {TOP_SIGNAL_COUNT}, choose at most {max_open_signals} that is worth opening now.
 This bot is running in {style_hint} mode.
+{force_mode_rules}
 
 === LEARNING CONTEXT ===
 {learning_context}
@@ -1056,10 +1120,10 @@ Rules:
 5. Use the lowest leverage that can meet Bitget minimum notional about {MIN_NOTIONAL} USDT. Avoid high leverage; unsafe setups above {RISK_MAX_LEVERAGE}x will be rejected.
 6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
 7. Use the learning context to compare LONG and SHORT performance separately. Pick the side that current price action, momentum, and recent results support — neither side is preferred by default.
-8. If one direction has weak win rate AND non-positive average net PnL in recent trades, require stronger evidence before opening that direction. If a direction is on loss-streak cooldown (see context), do NOT open that side.
+8. If one direction has weak win rate AND non-positive average net PnL in recent trades, require stronger evidence before opening that direction. If a direction is on loss-streak cooldown (see context), do NOT open that side unless FORCE TRADE MODE is active.
 9. The per-pair and side history shown above is net of fees. A pair or specific side with avg PnL near zero or negative over multiple trades is a fee-eating churn.
 10. Prefer pairs with clearly positive recent avg net PnL on the exact LONG/SHORT side you propose.
-11. Mark OPEN YES for at most {MAX_ORDERS_PER_CYCLE} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade.
+11. Mark OPEN YES for at most {max_open_signals} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade, unless FORCE TRADE MODE is active.
 
 Respond ONLY valid JSON:
 [
@@ -1372,23 +1436,32 @@ def estimate_position_net_pnl(position, current_price=None):
     return net_pnl, fee, size, current_price, entry_price
 
 def find_and_trade():
-    global last_trade_time, force_trade, daily_loss_locked_date, consecutive_loss_cooldown_until
+    global last_trade_time, force_trade, force_open_trade, daily_loss_locked_date, consecutive_loss_cooldown_until
+    force_open_requested = force_open_trade
     positions = get_auto_strategy_positions()
     balance = get_strategy_balance()
     today_net_pnl = get_strategy_today_net_pnl()
     today = datetime.now().strftime("%Y-%m-%d")
     if today_net_pnl <= -MAX_DAILY_LOSS_USD:
-        if daily_loss_locked_date != today:
-            send_telegram(f"🛑 <b>Daily loss limit reached</b>\nNet PnL: <b>{today_net_pnl:.4f} USDT</b>\nLimit: <b>-{MAX_DAILY_LOSS_USD:.4f} USDT</b>\nNew entries paused for today.")
-            daily_loss_locked_date = today
-        logger.info(f"Daily loss limit reached: {today_net_pnl:.4f}/-{MAX_DAILY_LOSS_USD:.4f}; entries paused")
-        force_trade = False
-        return
+        if force_open_requested:
+            logger.warning(f"Force trade overriding daily loss limit: {today_net_pnl:.4f}/-{MAX_DAILY_LOSS_USD:.4f}")
+        else:
+            if daily_loss_locked_date != today:
+                send_telegram(f"🛑 <b>Daily loss limit reached</b>\nNet PnL: <b>{today_net_pnl:.4f} USDT</b>\nLimit: <b>-{MAX_DAILY_LOSS_USD:.4f} USDT</b>\nNew entries paused for today.")
+                daily_loss_locked_date = today
+            logger.info(f"Daily loss limit reached: {today_net_pnl:.4f}/-{MAX_DAILY_LOSS_USD:.4f}; entries paused")
+            force_trade = False
+            force_open_trade = False
+            return
     if time.time() < consecutive_loss_cooldown_until:
         remaining = int((consecutive_loss_cooldown_until - time.time()) / 60) + 1
-        logger.info(f"Consecutive loss cooldown active ({remaining} min left); skipping new entries")
-        force_trade = False
-        return
+        if force_open_requested:
+            logger.warning(f"Force trade overriding consecutive loss cooldown ({remaining} min left)")
+        else:
+            logger.info(f"Consecutive loss cooldown active ({remaining} min left); skipping new entries")
+            force_trade = False
+            force_open_trade = False
+            return
     if not force_trade and last_trade_time and time.time() - last_trade_time < TRADE_COOLDOWN_MIN * 60:
         remaining = int(((TRADE_COOLDOWN_MIN * 60) - (time.time() - last_trade_time)) / 60) + 1
         logger.info(f"Trade cooldown active ({remaining} min left); skipping new entries")
@@ -1406,45 +1479,55 @@ def find_and_trade():
     if not candidates:
         logger.info("No candidates found")
         force_trade = False
+        force_open_trade = False
         return
     logger.info(f"Analyzing {len(candidates)} tickers...")
     update_blacklist()
     check_and_apply_loss_streak_cooldowns()
-    signals = analyze_top_signals(candidates, balance)
-    maybe_send_top_signals(signals, balance, len(positions))
+    signals = analyze_top_signals(candidates, balance, force_open_requested)
+    if force_open_requested:
+        send_top_signals(signals, balance, len(positions))
+    else:
+        maybe_send_top_signals(signals, balance, len(positions))
     force_trade = False
+    force_open_trade = False
     if len(positions) >= MAX_POSITIONS:
         logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}; signals only")
+        if force_open_requested:
+            send_telegram(f"⚠️ <b>Force trade skipped</b>\nAuto positions already full: <b>{len(positions)}/{MAX_POSITIONS}</b>.")
         return
     ticker_map = {t["symbol"]: t for t in candidates}
     existing_symbols = {p["symbol"] for p in positions}
     preferred = [s for s in signals if s["open"]]
-    order_candidates = preferred
+    order_candidates = signals if force_open_requested else preferred
     opened = 0
-    max_to_open = min(MAX_ORDERS_PER_CYCLE, MAX_POSITIONS - len(positions))
+    max_per_run = FORCE_TRADE_ORDERS_PER_COMMAND if force_open_requested else MAX_ORDERS_PER_CYCLE
+    max_to_open = min(max_per_run, MAX_POSITIONS - len(positions))
     for signal in order_candidates:
         if opened >= max_to_open: break
         symbol = signal["symbol"]
         if symbol in existing_symbols: continue
-        if symbol in blacklisted_pairs:
+        if force_open_requested:
+            logger.warning(f"Force trade bypassing strategy filters for {symbol} {signal['direction']}")
+        elif symbol in blacklisted_pairs:
             logger.info(f"Skipping {symbol} - blacklisted (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}%)")
             continue
-        if not direction_allowed(signal["direction"]):
+        if not force_open_requested and not direction_allowed(signal["direction"]):
             logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance / cooldown")
             continue
         bad_side_ev, side_stats = pair_direction_negative_ev(symbol, signal["direction"])
-        if bad_side_ev:
+        if not force_open_requested and bad_side_ev:
             logger.info(f"Skipping {symbol} {signal['direction']} - weak pair+side history (last {side_stats['total']}: avg {side_stats['avg_pnl']:+.4f} USDT, WR {side_stats['win_rate']:.0f}%)")
             continue
         bad_ev, ev_stats = pair_negative_ev(symbol)
-        if bad_ev:
+        if not force_open_requested and bad_ev:
             logger.info(f"Skipping {symbol} - negative EV (last {ev_stats['total']}: avg {ev_stats['avg_pnl']:+.4f} USDT, WR {ev_stats['win_rate']:.0f}%)")
             continue
         loss_streak, loss_streak_reason = pair_loss_streak_active(symbol)
-        if loss_streak:
+        if not force_open_requested and loss_streak:
             logger.info(f"Skipping {symbol} - pair cooldown ({loss_streak_reason})")
             continue
-        if signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]: continue
+        if not force_open_requested and (signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]): continue
         price = parse_float(ticker_map.get(symbol, {}).get("lastPr"), signal.get("price", 0.0))
         size, margin, leverage = calculate_position_size(balance, signal, price)
         notional = size * price
@@ -1491,6 +1574,15 @@ def find_and_trade():
             logger.error(f"Order failed for {symbol}: {res.get('msg')}")
     if opened == 0:
         logger.info("No orders opened this cycle")
+        if force_open_requested:
+            send_telegram("⚠️ <b>Force trade did not open an order</b>\nAll Top 10 candidates failed hard limits: max positions, duplicate pair, balance, leverage setup, or minimum order sizing.")
+
+def sleep_until_next_cycle(seconds):
+    end_at = time.time() + seconds
+    while bot_running and time.time() < end_at:
+        if force_trade:
+            return
+        time.sleep(min(1, max(0, end_at - time.time())))
 
 def manage_positions():
     global consecutive_losses, consecutive_loss_cooldown_until
@@ -1570,7 +1662,7 @@ def manage_positions():
                 continue
 
 def handle_commands():
-    global bot_running, force_trade, consecutive_losses, consecutive_loss_cooldown_until
+    global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, LLM_PROVIDER, DRY_RUN
     logger.info("Telegram handler started")
     while bot_running:
         try:
@@ -1615,6 +1707,12 @@ def handle_commands():
                     consecutive_losses = 0
                     consecutive_loss_cooldown_until = 0
                     send_telegram("⚡ Starting analysis...")
+                elif text == "/forcetrade":
+                    force_trade = True
+                    force_open_trade = True
+                    consecutive_losses = 0
+                    consecutive_loss_cooldown_until = 0
+                    send_telegram(f"⚡ <b>Force trade requested</b>\nBypassing learning filters/cooldowns and opening max <b>{FORCE_TRADE_ORDERS_PER_COMMAND}</b> pair if hard order limits allow it. Auto max positions stay <b>{MAX_POSITIONS}</b>.")
                 elif text.startswith("/mode"):
                     parts = text.split()
                     if len(parts) == 1:
@@ -1633,6 +1731,80 @@ def handle_commands():
                             logger.info(f"Trade mode changed to {TRADE_MODE.upper()}")
                         else:
                             send_telegram("⚠️ Gagal mengubah mode.")
+                elif text.startswith("/model"):
+                    global VIRTUALS_MODEL
+                    parts = text.split()
+                    if LLM_PROVIDER == "virtuals":
+                        all_models = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
+                        primary_model = VIRTUALS_MODEL
+                    else:
+                        all_models = [LLM_MODEL] + LLM_FALLBACK_MODELS
+                        primary_model = LLM_MODEL
+                    if len(parts) == 1:
+                        lines = [f"🧠 <b>Model ({LLM_PROVIDER.upper()})</b>\nCurrent: <code>{primary_model}</code>\n\n<b>Semua Model:</b>"]
+                        for i, m in enumerate(all_models):
+                            marker = " ✅" if m == primary_model else ""
+                            lines.append(f"{i+1}. <code>{m}</code>{marker}")
+                        lines.append(f"\nGunakan /model &lt;nomor&gt; untuk ganti.")
+                        send_telegram("\n".join(lines))
+                    else:
+                        try:
+                            idx = int(parts[1]) - 1
+                            if 0 <= idx < len(all_models):
+                                new_model = all_models[idx]
+                                if new_model == primary_model:
+                                    send_telegram(f"✅ Model sudah <code>{new_model}</code>.")
+                                else:
+                                    if LLM_PROVIDER == "virtuals":
+                                        VIRTUALS_MODEL = new_model
+                                    else:
+                                        LLM_MODEL = new_model
+                                    send_telegram(f"✅ Model diganti ke <code>{new_model}</code>.")
+                                    logger.info(f"Model ({LLM_PROVIDER}) changed to {new_model}")
+                            else:
+                                send_telegram(f"⚠️ Nomor tidak valid. Pilih 1-{len(all_models)}.")
+                        except ValueError:
+                            send_telegram("⚠️ Gunakan /model &lt;nomor&gt;")
+                elif text.startswith("/provider"):
+                    parts = text.split()
+                    if len(parts) == 1:
+                        send_telegram(f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER.upper()}</b>\nAvailable: <b>NVIDIA</b>, <b>VIRTUALS</b>\nUse /provider nvidia atau /provider virtuals")
+                    else:
+                        requested = parts[1].strip().lower()
+                        if requested in ("nvidia", "nv"):
+                            new_val = "nvidia"
+                        elif requested in ("virtuals", "virtual", "vrt"):
+                            new_val = "virtuals"
+                        else:
+                            send_telegram("⚠️ Provider tidak dikenal. Pilih: /provider nvidia atau /provider virtuals")
+                            continue
+                        if new_val == LLM_PROVIDER:
+                            send_telegram(f"✅ Provider sudah <b>{LLM_PROVIDER.upper()}</b>.")
+                        else:
+                            LLM_PROVIDER = new_val
+                            send_telegram(f"✅ Provider diganti ke <b>{LLM_PROVIDER.upper()}</b>.\nBot akan coba <b>{LLM_PROVIDER.upper()}</b> dulu di siklus berikutnya.")
+                            logger.info(f"LLM provider changed to {LLM_PROVIDER}")
+                elif text.startswith("/paper"):
+                    parts = text.split()
+                    if len(parts) == 1:
+                        send_telegram(f"📄 <b>Trade Mode</b>\nCurrent: <b>{'PAPER (DRY RUN)' if DRY_RUN else 'LIVE'}</b>\nUse /paper dry untuk paper trade, /paper live untuk real trade")
+                    else:
+                        requested = parts[1].strip().lower()
+                        if requested in ("dry", "paper", "simulasi", "sim"):
+                            new_val = True
+                            label = "PAPER (DRY RUN)"
+                        elif requested in ("live", "real", "nyata"):
+                            new_val = False
+                            label = "LIVE"
+                        else:
+                            send_telegram("⚠️ Pilih: /paper dry atau /paper live")
+                            continue
+                        if new_val == DRY_RUN:
+                            send_telegram(f"✅ Mode sudah <b>{label}</b>.")
+                        else:
+                            DRY_RUN = new_val
+                            send_telegram(f"✅ Mode diganti ke <b>{label}</b>.\nMulai siklus berikutnya akan pakai mode <b>{label}</b>.")
+                            logger.info(f"Trade mode changed to {'DRY RUN' if DRY_RUN else 'LIVE'}")
                 elif text.startswith("/long") or text.startswith("/short"):
                     parts = text.split()
                     direction = "LONG" if text.startswith("/long") else "SHORT"
@@ -1671,7 +1843,7 @@ def handle_commands():
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
                 elif text == "/help":
-                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force trade now (clears cooldown)\n/mode [normal|scalping] — switch trading mode\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nTrailing: arm at +{TRAILING_ACTIVATE_ROI_PCT:.1f}% ROI, exit on {TRAILING_STOP_PCT:.1f}% drawdown, floor {MIN_TRAILING_PROFIT_ROI_PCT:.1f}% ROI\nTime stop: {MAX_HOLD_HOURS}h max hold\nMax daily loss: ${MAX_DAILY_LOSS_USD}\nConsec. loss limit: {CONSECUTIVE_LOSS_LIMIT} → {CONSECUTIVE_LOSS_COOLDOWN_MIN} min cooldown")
+                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force scan now (clears cooldown)\n/forcetrade — force open 1 pair from Top {TOP_SIGNAL_COUNT}, bypass learning filters/cooldowns\n/mode [normal|scalping] — switch trading mode\n/model [nomor] — list/ganti LLM model\n/provider [nvidia|virtuals] — ganti LLM provider\n/paper [dry|live] — ganti paper / real trade\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nTrade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\nProvider: <b>{LLM_PROVIDER.upper()}</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nTrailing: arm at +{TRAILING_ACTIVATE_ROI_PCT:.1f}% ROI, exit on {TRAILING_STOP_PCT:.1f}% drawdown, floor {MIN_TRAILING_PROFIT_ROI_PCT:.1f}% ROI\nTime stop: {MAX_HOLD_HOURS}h max hold\nMax daily loss: ${MAX_DAILY_LOSS_USD}\nConsec. loss limit: {CONSECUTIVE_LOSS_LIMIT} → {CONSECUTIVE_LOSS_COOLDOWN_MIN} min cooldown")
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
@@ -1680,7 +1852,7 @@ def handle_commands():
 def main():
     global bot_running
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
-    send_telegram(f"🤖 <b>Bitget LLM Bot V2</b>\n🧠 <b>Learning Edition</b>\n\nMode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nMax positions: <b>{MAX_POSITIONS}</b>\nScan: <b>{SIGNAL_SCAN_COUNT} tickers / {SLEEP_MINUTES} min</b>\nTop signals: <b>{TOP_SIGNAL_COUNT}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b>\nSL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b>\nMin confidence: <b>{MIN_CONFIDENCE}%</b>\n\nType /help for commands.")
+    send_telegram(f"🤖 <b>Bitget LLM Bot V2</b>\n🧠 <b>Learning Edition</b>\n\nMode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER.upper()}</b>\nModel: <code>{LLM_MODEL}</code>\nMax positions: <b>{MAX_POSITIONS}</b>\nScan: <b>{SIGNAL_SCAN_COUNT} tickers / {SLEEP_MINUTES} min</b>\nTop signals: <b>{TOP_SIGNAL_COUNT}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b>\nSL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b>\nMin confidence: <b>{MIN_CONFIDENCE}%</b>\n\nType /help for commands.")
     init_db()
     cleanup_stale_dry_run_positions()
     t = threading.Thread(target=handle_commands, daemon=True)
@@ -1704,10 +1876,10 @@ def main():
             find_and_trade()
             if DRY_RUN and get_strategy_positions():
                 logger.info(f"Dry-run positions active; sleeping {DRY_RUN_POLL_SECONDS} sec...")
-                time.sleep(DRY_RUN_POLL_SECONDS)
+                sleep_until_next_cycle(DRY_RUN_POLL_SECONDS)
             elif not force_trade:
                 logger.info(f"Sleeping {SLEEP_MINUTES} min...")
-                time.sleep(SLEEP_MINUTES * 60)
+                sleep_until_next_cycle(SLEEP_MINUTES * 60)
             else:
                 time.sleep(5)
         except KeyboardInterrupt:
