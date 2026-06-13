@@ -111,7 +111,7 @@ MAX_MARGIN_PER_TRADE_FRACTION = 0.30
 MIN_FREE_BALANCE_USDT = 0.20
 MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
-SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
+SLEEP_MINUTES = 60
 
 MAX_POSITIONS = max(1, env_int("MAX_POSITIONS", env_int("MAX_PAIRS", 2)))
 MAX_ORDERS_PER_CYCLE = max(1, min(MAX_POSITIONS, env_int("MAX_ORDERS_PER_CYCLE", 1)))
@@ -899,6 +899,48 @@ def send_telegram(msg):
                 json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=10)
         except: pass
 
+def send_telegram_buttons(msg, buttons, chat_id=None):
+    targets = [chat_id] if chat_id else list(TELEGRAM_CHAT_IDS)
+    for cid in targets:
+        try:
+            reply_markup = {
+                "inline_keyboard": [
+                    [{"text": text, "callback_data": cb_data} for text, cb_data in row]
+                    for row in buttons
+                ]
+            }
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": msg, "parse_mode": "HTML", "reply_markup": reply_markup}, timeout=10)
+        except: pass
+
+def edit_message_buttons(chat_id, message_id, msg, buttons):
+    try:
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": text, "callback_data": cb_data} for text, cb_data in row]
+                for row in buttons
+            ]
+        }
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+            json={"chat_id": chat_id, "message_id": message_id, "text": msg, "parse_mode": "HTML", "reply_markup": reply_markup}, timeout=10)
+    except: pass
+
+def main_menu():
+    return [
+        [("📊 Status", "menu:status"), ("💰 Balance", "menu:balance")],
+        [("📈 History", "menu:history"), ("⚡ Trade", "menu:trade")],
+        [("⚡ Force", "menu:forcetrade"), ("🧠 Model", "menu:model")],
+        [("🔌 Provider", "menu:provider"), ("📄 Paper/Live", "menu:paper")],
+        [("⚙️ Mode", "menu:mode"), ("🛑 Stop", "menu:stop")],
+        [("📋 Help", "menu:help")],
+    ]
+
+def answer_callback(callback_query_id, text=""):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text}, timeout=10)
+    except: pass
+
 def get_telegram_updates():
     global last_update_id
     try:
@@ -910,7 +952,7 @@ def get_telegram_updates():
     except: return []
 
 def _try_llm_provider(prompt, base_url, api_key, models):
-    global LLM_MODEL, llm_model_cooldowns
+    global llm_model_cooldowns
     now = time.time()
     network_failures = 0
     for model in models:
@@ -927,10 +969,8 @@ def _try_llm_provider(prompt, base_url, api_key, models):
                 if data and "choices" in data and data["choices"]:
                     content = (data["choices"][0].get("message") or {}).get("content")
                     if content:
-                        if model != LLM_MODEL:
-                            logger.info(f"LLM fallback working: {model}")
-                            LLM_MODEL = model
-                        return content.strip()
+                        logger.info(f"LLM working: {model}")
+                        return content.strip(), model
                     logger.warning(f"LLM {model} returned empty content; trying next")
                     break
                 logger.error(f"LLM error on {model}: HTTP {status} body: {r.text[:300]}")
@@ -968,10 +1008,10 @@ def _try_llm_provider(prompt, base_url, api_key, models):
                     time.sleep(2)
                     continue
                 break
-    return None
+    return None, None
 
 def ask_llm(prompt):
-    global llm_cooldown_until, llm_model_cooldowns, LLM_MODEL
+    global llm_cooldown_until, llm_model_cooldowns, LLM_MODEL, VIRTUALS_MODEL
     now = time.time()
     if now < llm_cooldown_until:
         logger.warning("LLM cooldown active; skipping this analysis cycle")
@@ -997,8 +1037,14 @@ def ask_llm(prompt):
             continue
         attempted = True
         logger.info(f"Trying {name.upper()} provider ({len(models)} model(s))")
-        result = _try_llm_provider(prompt, base_url, api_key, models)
+        result, working_model = _try_llm_provider(prompt, base_url, api_key, models)
         if result:
+            if name == "virtuals" and working_model != VIRTUALS_MODEL:
+                logger.info(f"Virtuals fallback working: {working_model}")
+                VIRTUALS_MODEL = working_model
+            elif name == "nvidia" and working_model != LLM_MODEL:
+                logger.info(f"NVIDIA fallback working: {working_model}")
+                LLM_MODEL = working_model
             return result
         logger.warning(f"{name.upper()} provider failed; trying next")
     if attempted:
@@ -1661,6 +1707,42 @@ def manage_positions():
                 logger.info(f"{prefix}Time stop {symbol} | Age: {age_hours:.1f}h | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f}")
                 continue
 
+def handle_status(chat_id):
+    positions, auto_positions, manual_count = get_position_counts()
+    balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
+    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+    if not positions:
+        send_telegram_buttons(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>", [["🔙 Menu", "menu:main"]], chat_id)
+    else:
+        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
+        for p in positions:
+            entry = float(p.get("openPriceAvg", 0))
+            if DRY_RUN:
+                ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
+                current = parse_float(ticker.get("lastPr"), entry)
+                pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+            else:
+                current = float(p.get("markPrice", 0))
+                pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+            emoji = "🟢" if pnl > 0 else "🔴"
+            pnl_pct = ((current - entry) / entry * 100) if p.get("holdSide") == "long" else ((entry - current) / entry * 100)
+            lines.append(f"{emoji} {p.get('holdSide','').upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+        lines.append("")
+        send_telegram_buttons("\n\n".join(lines), [["🔙 Menu", "menu:main"]], chat_id)
+
+def handle_balance(chat_id):
+    balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
+    real_balance = get_balance() if DRY_RUN else balance
+    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+    send_telegram_buttons(f"💰 <b>Balance</b>\nMode: <b>{mode}</b>\nAvailable: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>", [["🔙 Menu", "menu:main"]], chat_id)
+
+def handle_history(chat_id):
+    summary = get_trade_summary()
+    if not summary:
+        send_telegram_buttons("📈 Belum ada trade history.", [["🔙 Menu", "menu:main"]], chat_id)
+    else:
+        send_telegram_buttons(f"📈 <b>Trade History</b>\n\nTotal trades: <b>{summary['total_trades']}</b>\nWin rate: <b>{summary['win_rate']}</b>\nAvg PnL: <b>{summary['avg_pnl']} USDT</b>\nBest pair: <b>{summary['best_pair']}</b>\nWorst pair: <b>{summary['worst_pair']}</b>\n\n<b>Last 10 Trades:</b>\n{summary['last_10']}", [["🔙 Menu", "menu:main"]], chat_id)
+
 def handle_commands():
     global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, LLM_PROVIDER, DRY_RUN
     logger.info("Telegram handler started")
@@ -1668,8 +1750,188 @@ def handle_commands():
         try:
             updates = get_telegram_updates()
             for u in updates:
+                cb = u.get("callback_query")
+                if cb:
+                    chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    if chat_id not in TELEGRAM_CHAT_IDS:
+                        continue
+                    cb_data = cb.get("data", "")
+                    cb_id = cb.get("id", "")
+                    msg_id = cb.get("message", {}).get("message_id")
+                    if cb_data.startswith("mdl:"):
+                        parts = cb_data.split(":")
+                        if len(parts) == 3:
+                            _, prov, idx_str = parts
+                            idx = int(idx_str)
+                            if prov == "n":
+                                all_m = [LLM_MODEL] + LLM_FALLBACK_MODELS
+                                if 0 <= idx < len(all_m):
+                                    new_m = all_m[idx]
+                                    if new_m != LLM_MODEL:
+                                        LLM_MODEL = new_m
+                                        logger.info(f"Model changed to {LLM_MODEL}")
+                            elif prov == "v":
+                                all_m = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
+                                if 0 <= idx < len(all_m):
+                                    new_m = all_m[idx]
+                                    if new_m != VIRTUALS_MODEL:
+                                        VIRTUALS_MODEL = new_m
+                                        logger.info(f"Virtuals model changed to {VIRTUALS_MODEL}")
+                        edit_message_buttons(chat_id, msg_id, f"🧠 Model ({LLM_PROVIDER.upper()})\nCurrent: <code>{LLM_MODEL if LLM_PROVIDER=='nvidia' else VIRTUALS_MODEL}</code>", [["🔙 Menu", "menu:main"]])
+                        answer_callback(cb_id)
+                        continue
+                    if cb_data == "menu:main":
+                        edit_message_buttons(chat_id, msg_id, "🤖 <b>Bitget LLM Bot</b>\nPilih menu:", main_menu())
+                        answer_callback(cb_id)
+                        continue
+                    if cb_data == "menu:status":
+                        answer_callback(cb_id)
+                        handle_status(chat_id)
+                        continue
+                    if cb_data == "menu:balance":
+                        answer_callback(cb_id)
+                        handle_balance(chat_id)
+                        continue
+                    if cb_data == "menu:history":
+                        answer_callback(cb_id)
+                        handle_history(chat_id)
+                        continue
+                    if cb_data == "menu:trade":
+                        force_trade = True
+                        consecutive_losses = 0
+                        consecutive_loss_cooldown_until = 0
+                        answer_callback(cb_id, "⚡ Scanning...")
+                        send_telegram("⚡ Starting analysis...")
+                        continue
+                    if cb_data == "menu:forcetrade":
+                        force_trade = True
+                        force_open_trade = True
+                        consecutive_losses = 0
+                        consecutive_loss_cooldown_until = 0
+                        answer_callback(cb_id, "⚡ Force trade...")
+                        send_telegram(f"⚡ <b>Force trade requested</b>\nBypassing filters/cooldowns.")
+                        continue
+                    if cb_data == "menu:model":
+                        answer_callback(cb_id)
+                        if LLM_PROVIDER == "virtuals":
+                            all_m = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
+                            primary = VIRTUALS_MODEL
+                            prov = "v"
+                        else:
+                            all_m = [LLM_MODEL] + LLM_FALLBACK_MODELS
+                            primary = LLM_MODEL
+                            prov = "n"
+                        btns = []
+                        for i, m in enumerate(all_m):
+                            active = " ✅" if m == primary else ""
+                            short = m.split("/")[-1].split("-")[0] if "/" in m else m.split("-")[0]
+                            btns.append([(f"{i+1}. {short}{active}", f"mdl:{prov}:{i}")])
+                        btns.append([("🔙 Menu", "menu:main")])
+                        edit_message_buttons(chat_id, msg_id, f"🧠 <b>Model ({LLM_PROVIDER.upper()})</b>\nCurrent: <code>{primary}</code>", btns)
+                        continue
+                    if cb_data == "menu:provider":
+                        answer_callback(cb_id)
+                        active = LLM_PROVIDER
+                        btns = [
+                            [("NVIDIA ✅" if active == "nvidia" else "NVIDIA", "prov:nvidia")],
+                            [("VIRTUALS ✅" if active == "virtuals" else "VIRTUALS", "prov:virtuals")],
+                            [("🔙 Menu", "menu:main")],
+                        ]
+                        edit_message_buttons(chat_id, msg_id, f"🔌 <b>LLM Provider</b>\nCurrent: <b>{active.upper()}</b>", btns)
+                        continue
+                    if cb_data == "menu:paper":
+                        answer_callback(cb_id)
+                        active = "dry" if DRY_RUN else "live"
+                        btns = [
+                            [("📄 PAPER ✅" if active == "dry" else "📄 PAPER", "paper:dry")],
+                            [("💰 LIVE ✅" if active == "live" else "💰 LIVE", "paper:live")],
+                            [("🔙 Menu", "menu:main")],
+                        ]
+                        edit_message_buttons(chat_id, msg_id, f"📄 <b>Trade Mode</b>\nCurrent: <b>{'PAPER (DRY RUN)' if DRY_RUN else 'LIVE'}</b>", btns)
+                        continue
+                    if cb_data == "menu:mode":
+                        answer_callback(cb_id)
+                        active = TRADE_MODE
+                        btns = [
+                            [("⚡ Scalping ✅" if active == "scalping" else "⚡ Scalping", "mode:scalping")],
+                            [("📊 Normal ✅" if active == "normal" else "📊 Normal", "mode:normal")],
+                            [("🔙 Menu", "menu:main")],
+                        ]
+                        edit_message_buttons(chat_id, msg_id, f"⚙️ <b>Trading Mode</b>\nCurrent: <b>{active.upper()}</b>", btns)
+                        continue
+                    if cb_data == "menu:stop":
+                        answer_callback(cb_id, "🛑 Stopping bot...")
+                        send_telegram("🛑 Bot stopped.")
+                        bot_running = False
+                        continue
+                    if cb_data == "menu:help":
+                        answer_callback(cb_id)
+                        msg = (
+                            f"📋 <b>Menu Bantuan</b>\n\n"
+                            f"📊 <b>Status</b> — lihat posisi + PnL\n"
+                            f"💰 <b>Balance</b> — saldo + daily PnL\n"
+                            f"📈 <b>History</b> — statistik trading\n"
+                            f"⚡ <b>Trade</b> — scan sinyal sekarang\n"
+                            f"⚡ <b>Force</b> — paksa buka posisi\n"
+                            f"🧠 <b>Model</b> — ganti model LLM\n"
+                            f"🔌 <b>Provider</b> — ganti LLM provider\n"
+                            f"📄 <b>Paper/Live</b> — ganti mode trading\n"
+                            f"⚙️ <b>Mode</b> — scalping / normal\n"
+                            f"🛑 <b>Stop</b> — matikan bot\n\n"
+                            f"<b>Settings:</b>\n"
+                            f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
+                            f"Provider: <b>{LLM_PROVIDER.upper()}</b>\n"
+                            f"Mode: {TRADE_MODE.upper()}\n"
+                            f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
+                            f"Scan: every {SLEEP_MINUTES} min"
+                        )
+                        edit_message_buttons(chat_id, msg_id, msg, [["🔙 Menu", "menu:main"]])
+                        continue
+                    if cb_data.startswith("prov:"):
+                        val = cb_data.split(":")[1]
+                        if val != LLM_PROVIDER:
+                            LLM_PROVIDER = val
+                            logger.info(f"LLM provider changed to {LLM_PROVIDER}")
+                        answer_callback(cb_id, f"Provider: {val.upper()}")
+                        edit_message_buttons(chat_id, msg_id, f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER.upper()}</b>", [
+                            [("NVIDIA ✅" if LLM_PROVIDER == "nvidia" else "NVIDIA", "prov:nvidia")],
+                            [("VIRTUALS ✅" if LLM_PROVIDER == "virtuals" else "VIRTUALS", "prov:virtuals")],
+                            [("🔙 Menu", "menu:main")],
+                        ])
+                        continue
+                    if cb_data.startswith("paper:"):
+                        val = cb_data.split(":")[1]
+                        new_val = val == "dry"
+                        label = "PAPER (DRY RUN)" if new_val else "LIVE"
+                        if new_val != DRY_RUN:
+                            DRY_RUN = new_val
+                            logger.info(f"Trade mode changed to {'DRY RUN' if DRY_RUN else 'LIVE'}")
+                        answer_callback(cb_id, label)
+                        edit_message_buttons(chat_id, msg_id, f"📄 <b>Trade Mode</b>\nCurrent: <b>{label}</b>", [
+                            [("📄 PAPER ✅" if DRY_RUN else "📄 PAPER", "paper:dry")],
+                            [("💰 LIVE ✅" if not DRY_RUN else "💰 LIVE", "paper:live")],
+                            [("🔙 Menu", "menu:main")],
+                        ])
+                        continue
+                    if cb_data.startswith("mode:"):
+                        val = cb_data.split(":")[1]
+                        if val != TRADE_MODE and apply_trade_mode(val):
+                            logger.info(f"Trade mode changed to {TRADE_MODE.upper()}")
+                        answer_callback(cb_id, f"Mode: {TRADE_MODE.upper()}")
+                        active = TRADE_MODE
+                        edit_message_buttons(chat_id, msg_id, f"⚙️ <b>Trading Mode</b>\nCurrent: <b>{active.upper()}</b>", [
+                            [("⚡ Scalping ✅" if active == "scalping" else "⚡ Scalping", "mode:scalping")],
+                            [("📊 Normal ✅" if active == "normal" else "📊 Normal", "mode:normal")],
+                            [("🔙 Menu", "menu:main")],
+                        ])
+                        continue
+                    answer_callback(cb_id)
+                    continue
                 msg, chat_id, text = u.get("message", {}), str(u.get("message", {}).get("chat", {}).get("id", "")), u.get("message", {}).get("text", "").strip().lower()
                 if chat_id not in TELEGRAM_CHAT_IDS: continue
+                if text in ("/start", "/menu") or not text.startswith("/"):
+                    send_telegram_buttons("🤖 <b>Bitget LLM Bot</b>\nPilih menu:", main_menu(), chat_id)
+                    continue
                 if text == "/status":
                     positions, auto_positions, manual_count = get_position_counts()
                     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
@@ -1713,6 +1975,24 @@ def handle_commands():
                     consecutive_losses = 0
                     consecutive_loss_cooldown_until = 0
                     send_telegram(f"⚡ <b>Force trade requested</b>\nBypassing learning filters/cooldowns and opening max <b>{FORCE_TRADE_ORDERS_PER_COMMAND}</b> pair if hard order limits allow it. Auto max positions stay <b>{MAX_POSITIONS}</b>.")
+                elif text == "/model":
+                    if LLM_PROVIDER == "virtuals":
+                        all_m = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
+                        primary = VIRTUALS_MODEL
+                        prov = "v"
+                    else:
+                        all_m = [LLM_MODEL] + LLM_FALLBACK_MODELS
+                        primary = LLM_MODEL
+                        prov = "n"
+                    buttons = []
+                    for i, m in enumerate(all_m):
+                        active = " ✅" if m == primary else ""
+                        short = m.split("/")[-1].split("-")[0] if "/" in m else m.split("-")[0]
+                        label = f"{i+1}. {short}{active}"
+                        buttons.append([(label, f"mdl:{prov}:{i}")])
+                    send_telegram_buttons(
+                        f"🧠 <b>Model ({LLM_PROVIDER.upper()})</b>\nCurrent: <code>{primary}</code>",
+                        buttons)
                 elif text.startswith("/mode"):
                     parts = text.split()
                     if len(parts) == 1:
@@ -1731,40 +2011,6 @@ def handle_commands():
                             logger.info(f"Trade mode changed to {TRADE_MODE.upper()}")
                         else:
                             send_telegram("⚠️ Gagal mengubah mode.")
-                elif text.startswith("/model"):
-                    global VIRTUALS_MODEL
-                    parts = text.split()
-                    if LLM_PROVIDER == "virtuals":
-                        all_models = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
-                        primary_model = VIRTUALS_MODEL
-                    else:
-                        all_models = [LLM_MODEL] + LLM_FALLBACK_MODELS
-                        primary_model = LLM_MODEL
-                    if len(parts) == 1:
-                        lines = [f"🧠 <b>Model ({LLM_PROVIDER.upper()})</b>\nCurrent: <code>{primary_model}</code>\n\n<b>Semua Model:</b>"]
-                        for i, m in enumerate(all_models):
-                            marker = " ✅" if m == primary_model else ""
-                            lines.append(f"{i+1}. <code>{m}</code>{marker}")
-                        lines.append(f"\nGunakan /model &lt;nomor&gt; untuk ganti.")
-                        send_telegram("\n".join(lines))
-                    else:
-                        try:
-                            idx = int(parts[1]) - 1
-                            if 0 <= idx < len(all_models):
-                                new_model = all_models[idx]
-                                if new_model == primary_model:
-                                    send_telegram(f"✅ Model sudah <code>{new_model}</code>.")
-                                else:
-                                    if LLM_PROVIDER == "virtuals":
-                                        VIRTUALS_MODEL = new_model
-                                    else:
-                                        LLM_MODEL = new_model
-                                    send_telegram(f"✅ Model diganti ke <code>{new_model}</code>.")
-                                    logger.info(f"Model ({LLM_PROVIDER}) changed to {new_model}")
-                            else:
-                                send_telegram(f"⚠️ Nomor tidak valid. Pilih 1-{len(all_models)}.")
-                        except ValueError:
-                            send_telegram("⚠️ Gunakan /model &lt;nomor&gt;")
                 elif text.startswith("/provider"):
                     parts = text.split()
                     if len(parts) == 1:
@@ -1843,7 +2089,25 @@ def handle_commands():
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
                 elif text == "/help":
-                    send_telegram(f"📋 <b>Commands</b>\n\n/status — positions + PnL\n/balance — balance + daily PnL\n/history — trade stats\n/trade — force scan now (clears cooldown)\n/forcetrade — force open 1 pair from Top {TOP_SIGNAL_COUNT}, bypass learning filters/cooldowns\n/mode [normal|scalping] — switch trading mode\n/model [nomor] — list/ganti LLM model\n/provider [nvidia|virtuals] — ganti LLM provider\n/paper [dry|live] — ganti paper / real trade\n/long SYMBOL [margin] [leverage] — manual long\n/short SYMBOL [margin] [leverage] — manual short\n/close [SYMBOL] — close position(s)\n/stop — stop bot\n\n<b>Settings:</b>\nTrade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\nProvider: <b>{LLM_PROVIDER.upper()}</b>\nMode: {TRADE_MODE.upper()}\nAuto max positions: {MAX_POSITIONS}\nManual trades: not counted in auto limit\nTP: {TAKE_PROFIT_ROI_PCT:.0f}% ROI\nSL: {STOP_LOSS_ROI_PCT:.0f}% ROI\nTrailing: arm at +{TRAILING_ACTIVATE_ROI_PCT:.1f}% ROI, exit on {TRAILING_STOP_PCT:.1f}% drawdown, floor {MIN_TRAILING_PROFIT_ROI_PCT:.1f}% ROI\nTime stop: {MAX_HOLD_HOURS}h max hold\nMax daily loss: ${MAX_DAILY_LOSS_USD}\nConsec. loss limit: {CONSECUTIVE_LOSS_LIMIT} → {CONSECUTIVE_LOSS_COOLDOWN_MIN} min cooldown")
+                    send_telegram_buttons(
+                        f"📋 <b>Menu Bantuan</b>\n\n"
+                        f"📊 Status — lihat posisi + PnL\n"
+                        f"💰 Balance — saldo + daily PnL\n"
+                        f"📈 History — statistik trading\n"
+                        f"⚡ Trade — scan sinyal sekarang\n"
+                        f"⚡ Force — paksa buka posisi\n"
+                        f"🧠 Model — ganti model LLM\n"
+                        f"🔌 Provider — ganti LLM provider\n"
+                        f"📄 Paper/Live — ganti mode trading\n"
+                        f"⚙️ Mode — scalping / normal\n"
+                        f"🛑 Stop — matikan bot\n\n"
+                        f"<b>Settings:</b>\n"
+                        f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
+                        f"Provider: <b>{LLM_PROVIDER.upper()}</b>\n"
+                        f"Mode: {TRADE_MODE.upper()}\n"
+                        f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
+                        f"Scan: every {SLEEP_MINUTES} min",
+                        [["🔙 Menu", "menu:main"]])
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
@@ -1852,7 +2116,7 @@ def handle_commands():
 def main():
     global bot_running
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
-    send_telegram(f"🤖 <b>Bitget LLM Bot V2</b>\n🧠 <b>Learning Edition</b>\n\nMode: <b>{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER.upper()}</b>\nModel: <code>{LLM_MODEL}</code>\nMax positions: <b>{MAX_POSITIONS}</b>\nScan: <b>{SIGNAL_SCAN_COUNT} tickers / {SLEEP_MINUTES} min</b>\nTop signals: <b>{TOP_SIGNAL_COUNT}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b>\nSL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b>\nMin confidence: <b>{MIN_CONFIDENCE}%</b>\n\nType /help for commands.")
+    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER.upper()}</b>\nModel: <code>{LLM_MODEL if LLM_PROVIDER=='nvidia' else VIRTUALS_MODEL}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}%</b> | SL: <b>{STOP_LOSS_ROI_PCT:.0f}%</b>", main_menu())
     init_db()
     cleanup_stale_dry_run_positions()
     t = threading.Thread(target=handle_commands, daemon=True)
