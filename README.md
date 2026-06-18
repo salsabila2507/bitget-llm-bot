@@ -85,12 +85,17 @@ Switch mode from Telegram:
 
 ## LLM Provider
 
-The bot uses the NVIDIA OpenAI-compatible API.
+The bot supports multiple OpenAI-compatible LLM providers:
 
-Kimi 2.6 was checked but timed out in the current setup, so the active fallback model is:
+- `nvidia`
+- `virtuals`
+- `tokenrouter`
+
+TokenRouter uses:
 
 ```text
-meta/llama-3.3-70b-instruct
+TOKENROUTER_BASE_URL=https://api.tokenrouter.com/v1
+TOKENROUTER_MODEL=MiniMax-M3
 ```
 
 ## Telegram Commands
@@ -101,6 +106,9 @@ meta/llama-3.3-70b-instruct
 /history             trade stats
 /trade               force a scan now
 /forcetrade          force open 1 pair from top 10 signals, max 2 auto positions
+/model              show/select models for the active provider
+/provider           show/select LLM provider
+/provider tokenrouter
 /mode                show current mode
 /mode scalping       switch to scalping mode
 /mode normal         switch to normal mode
@@ -137,7 +145,7 @@ pkill -f '[b]itget_llm_trader.py'
 
 ## Runtime Notes
 
-- The bot needs network access to `api.bitget.com`, Telegram, and the NVIDIA API.
+- The bot needs network access to `api.bitget.com`, Telegram, and the configured LLM provider API.
 - If Bitget DNS/network fails, the bot may stay alive but cannot fetch fresh tickers or update dry-run PnL correctly.
 - If there are already 2 open dry-run positions, the bot will continue scanning and sending signals but will not open another simulated trade until a position closes.
 - Dry-run mode is for learning and validation only. It does not guarantee real trading profit.

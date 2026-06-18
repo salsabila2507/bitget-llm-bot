@@ -1,4 +1,4 @@
-import os, sys, subprocess, time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3
+import os, sys, subprocess, time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3, re
 from datetime import datetime
 from collections import defaultdict
 
@@ -54,6 +54,9 @@ LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-4-maverick-17b-128e-i
 VIRTUALS_API_KEY = os.environ.get("VIRTUALS_API_KEY", "")
 VIRTUALS_BASE_URL = "https://compute.virtuals.io/v1"
 VIRTUALS_MODEL = os.environ.get("VIRTUALS_MODEL", "deepseek-v4-flash")
+TOKENROUTER_API_KEY = os.environ.get("TOKENROUTER_API_KEY", "")
+TOKENROUTER_BASE_URL = os.environ.get("TOKENROUTER_BASE_URL", "https://api.tokenrouter.com/v1").rstrip("/")
+TOKENROUTER_MODEL = os.environ.get("TOKENROUTER_MODEL", "MiniMax-M3")
 LLM_FALLBACK_MODELS = [
     "deepseek-ai/deepseek-v4-flash",
     "mistralai/mistral-large-3-675b-instruct-2512",
@@ -66,7 +69,25 @@ VIRTUALS_FALLBACK_MODELS = [
     "deepseek-v4-pro",
     "openai-gpt-55-pro",
 ]
+TOKENROUTER_FALLBACK_MODELS = []
+LLM_PROVIDER_LABELS = {
+    "nvidia": "NVIDIA",
+    "virtuals": "VIRTUALS",
+    "tokenrouter": "TOKENROUTER",
+}
+SUPPORTED_LLM_PROVIDERS = tuple(LLM_PROVIDER_LABELS.keys())
+LLM_PROVIDER_CODES = {
+    "nvidia": "n",
+    "virtuals": "v",
+    "tokenrouter": "t",
+}
+LLM_PROVIDER_BY_CODE = {v: k for k, v in LLM_PROVIDER_CODES.items()}
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "nvidia").strip().lower()
+if LLM_PROVIDER == "tok3nrouter":
+    LLM_PROVIDER = "tokenrouter"
+if LLM_PROVIDER not in SUPPORTED_LLM_PROVIDERS:
+    logger.warning(f"Unknown LLM_PROVIDER={LLM_PROVIDER}; using nvidia")
+    LLM_PROVIDER = "nvidia"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_CHAT_IDS = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if c.strip()}
@@ -90,6 +111,9 @@ PAIR_DIRECTION_RECENT_TRADE_LIMIT = 8
 PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD = 0.0
 PAIR_DIRECTION_MIN_TRADES = 2
 PAIR_DIRECTION_BLOCK_WIN_RATE = 50.0
+PAIR_DIRECTION_EDGE_MIN_TRADES = env_int("PAIR_DIRECTION_EDGE_MIN_TRADES", 3)
+PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 60.0)
+PAIR_DIRECTION_EDGE_MIN_AVG_PNL = env_float("PAIR_DIRECTION_EDGE_MIN_AVG_PNL", 0.0)
 PAIR_LOSS_STREAK_LIMIT = 2
 PAIR_LOSS_STREAK_COOLDOWN_HOURS = 12
 MIN_QUOTE_VOLUME_USDT = 500000.0
@@ -107,7 +131,8 @@ MIN_LEVERAGE, MAX_LEVERAGE = 1, 125
 RISK_MAX_LEVERAGE = 5
 LOW_CONFIDENCE_MAX_LEVERAGE = 4
 MID_CONFIDENCE_MAX_LEVERAGE = 4
-MAX_MARGIN_PER_TRADE_FRACTION = 0.30
+MAX_MARGIN_PER_TRADE_FRACTION = env_float("MAX_MARGIN_PER_TRADE_FRACTION", 0.30)
+DRY_RUN_TARGET_MARGIN_PER_TRADE_FRACTION = env_float("DRY_RUN_TARGET_MARGIN_PER_TRADE_FRACTION", 0.45)
 MIN_FREE_BALANCE_USDT = 0.20
 MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
@@ -122,6 +147,19 @@ TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (
 TRAILING_ACTIVATE_ROI_PCT = 8.0 if TRADE_MODE == "scalping" else 20.0
 MIN_TRAILING_PROFIT_ROI_PCT = 5.0 if TRADE_MODE == "scalping" else 10.0
 CONSECUTIVE_LOSS_LIMIT = 3
+AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 88)
+AUTO_OPEN_CONFIDENCE_NORMAL = env_int("AUTO_OPEN_CONFIDENCE_NORMAL", 82)
+RECENT_PROFIT_WINDOW = env_int("RECENT_PROFIT_WINDOW", 10)
+RECENT_PROFIT_MIN_TRADES = env_int("RECENT_PROFIT_MIN_TRADES", 5)
+RECENT_PROFIT_MIN_WIN_RATE = env_float("RECENT_PROFIT_MIN_WIN_RATE", 60.0)
+RECENT_DEFENSE_CONFIDENCE_BONUS = env_int("RECENT_DEFENSE_CONFIDENCE_BONUS", 4)
+AUTO_OPEN_TARGET_WIN_RATE = env_float("AUTO_OPEN_TARGET_WIN_RATE", 80.0)
+MIN_REWARD_RISK_RATIO = env_float("MIN_REWARD_RISK_RATIO", 1.35)
+PROFIT_GUARD_MAX_LEVERAGE = env_int("PROFIT_GUARD_MAX_LEVERAGE", 4)
+PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE = env_int("PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE", 92)
+PROFIT_GUARD_SIDE_MIN_TRADES = env_int("PROFIT_GUARD_SIDE_MIN_TRADES", 2)
+PROFIT_GUARD_SIDE_MIN_WIN_RATE = env_float("PROFIT_GUARD_SIDE_MIN_WIN_RATE", 55.0)
+PROFIT_GUARD_PAIR_MIN_WIN_RATE = env_float("PROFIT_GUARD_PAIR_MIN_WIN_RATE", 50.0)
 TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
 DB_PATH = "/root/trade_history.db"
@@ -517,7 +555,7 @@ def direction_allowed(direction):
     direction = str(direction).upper()
     if direction not in ("LONG", "SHORT"):
         return False
-    if time.time() < direction_cooldowns.get(direction, 0):
+    if direction_cooldown_active(direction):
         return False
     stats = get_recent_direction_performance()
     d = stats[direction]
@@ -528,6 +566,10 @@ def direction_allowed(direction):
     if d["win_rate"] < DIRECTION_BLOCK_WIN_RATE and d["avg_pnl"] <= DIRECTION_BLOCK_AVG_PNL:
         return False
     return True
+
+def direction_cooldown_active(direction):
+    direction = str(direction).upper()
+    return time.time() < direction_cooldowns.get(direction, 0)
 
 def evaluate_direction_loss_streak(direction):
     """If the last N closed trades on this side are all losses, return cooldown reason."""
@@ -673,6 +715,29 @@ def get_pair_direction_recent_stats(symbol, direction, limit=PAIR_DIRECTION_RECE
         "avg_pnl": sum(rows) / total,
     }
 
+def get_recent_trade_stats(limit=RECENT_PROFIT_WINDOW):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """SELECT pnl FROM trades
+               WHERE closed_at IS NOT NULL AND action NOT LIKE 'STALE_%'
+               ORDER BY closed_at DESC LIMIT ?""",
+            (limit,))
+        rows = [parse_float(r[0], 0.0) for r in cur.fetchall() if r[0] is not None]
+        conn.close()
+    except Exception:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    total = len(rows)
+    if total == 0:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0}
+    wins = sum(1 for pnl in rows if pnl > 0)
+    return {
+        "total": total,
+        "wins": wins,
+        "win_rate": wins / total * 100,
+        "avg_pnl": sum(rows) / total,
+    }
+
 def pair_direction_negative_ev(symbol, direction):
     s = get_pair_direction_recent_stats(symbol, direction)
     if s["total"] < PAIR_DIRECTION_MIN_TRADES:
@@ -682,6 +747,15 @@ def pair_direction_negative_ev(symbol, direction):
         and s["win_rate"] < PAIR_DIRECTION_BLOCK_WIN_RATE
     )
     return is_bad, s
+
+def pair_direction_has_edge(symbol, direction):
+    s = get_pair_direction_recent_stats(symbol, direction)
+    has_edge = (
+        s["total"] >= PAIR_DIRECTION_EDGE_MIN_TRADES
+        and s["avg_pnl"] > PAIR_DIRECTION_EDGE_MIN_AVG_PNL
+        and s["win_rate"] >= PAIR_DIRECTION_EDGE_MIN_WIN_RATE
+    )
+    return has_edge, s
 
 def get_learning_context():
     try:
@@ -951,7 +1025,42 @@ def get_telegram_updates():
         return updates
     except: return []
 
-def _try_llm_provider(prompt, base_url, api_key, models):
+def provider_model_list(provider):
+    if provider == "virtuals":
+        return [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
+    if provider == "tokenrouter":
+        return [TOKENROUTER_MODEL] + TOKENROUTER_FALLBACK_MODELS
+    return [LLM_MODEL] + LLM_FALLBACK_MODELS
+
+def provider_primary_model(provider):
+    if provider == "virtuals":
+        return VIRTUALS_MODEL
+    if provider == "tokenrouter":
+        return TOKENROUTER_MODEL
+    return LLM_MODEL
+
+def active_llm_model():
+    return provider_primary_model(LLM_PROVIDER)
+
+def provider_button_rows():
+    rows = []
+    for provider in SUPPORTED_LLM_PROVIDERS:
+        label = LLM_PROVIDER_LABELS[provider]
+        rows.append([(f"{label} ✅" if LLM_PROVIDER == provider else label, f"prov:{provider}")])
+    rows.append([("🔙 Menu", "menu:main")])
+    return rows
+
+def llm_request_payload(provider, model, prompt):
+    content = prompt
+    if provider == "tokenrouter":
+        content = [{"type": "text", "text": prompt}]
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 1800,
+    }
+
+def _try_llm_provider(prompt, name, base_url, api_key, models):
     global llm_model_cooldowns
     now = time.time()
     network_failures = 0
@@ -960,7 +1069,7 @@ def _try_llm_provider(prompt, base_url, api_key, models):
             try:
                 r = requests.post(f"{base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1800}, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+                    json=llm_request_payload(name, model, prompt), timeout=LLM_REQUEST_TIMEOUT_SECONDS)
                 status = r.status_code
                 try:
                     data = r.json()
@@ -1011,17 +1120,20 @@ def _try_llm_provider(prompt, base_url, api_key, models):
     return None, None
 
 def ask_llm(prompt):
-    global llm_cooldown_until, llm_model_cooldowns, LLM_MODEL, VIRTUALS_MODEL
+    global llm_cooldown_until, llm_model_cooldowns, LLM_MODEL, VIRTUALS_MODEL, TOKENROUTER_MODEL
     now = time.time()
     if now < llm_cooldown_until:
         logger.warning("LLM cooldown active; skipping this analysis cycle")
         return None
-    providers = [
+    provider_configs = [
         ("nvidia", NVIDIA_BASE_URL, NVIDIA_API_KEY, [LLM_MODEL] + LLM_FALLBACK_MODELS),
         ("virtuals", VIRTUALS_BASE_URL, VIRTUALS_API_KEY, [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS),
+        ("tokenrouter", TOKENROUTER_BASE_URL, TOKENROUTER_API_KEY, [TOKENROUTER_MODEL] + TOKENROUTER_FALLBACK_MODELS),
     ]
-    if LLM_PROVIDER == "virtuals":
-        providers.reverse()
+    providers = sorted(
+        provider_configs,
+        key=lambda p: 0 if p[0] == LLM_PROVIDER else 1,
+    )
     attempted = False
     for name, base_url, api_key, model_list in providers:
         if not api_key:
@@ -1037,11 +1149,14 @@ def ask_llm(prompt):
             continue
         attempted = True
         logger.info(f"Trying {name.upper()} provider ({len(models)} model(s))")
-        result, working_model = _try_llm_provider(prompt, base_url, api_key, models)
+        result, working_model = _try_llm_provider(prompt, name, base_url, api_key, models)
         if result:
             if name == "virtuals" and working_model != VIRTUALS_MODEL:
                 logger.info(f"Virtuals fallback working: {working_model}")
                 VIRTUALS_MODEL = working_model
+            elif name == "tokenrouter" and working_model != TOKENROUTER_MODEL:
+                logger.info(f"TokenRouter fallback working: {working_model}")
+                TOKENROUTER_MODEL = working_model
             elif name == "nvidia" and working_model != LLM_MODEL:
                 logger.info(f"NVIDIA fallback working: {working_model}")
                 LLM_MODEL = working_model
@@ -1103,10 +1218,31 @@ def analyze_top_signals_fallback(tickers, balance):
             "size": size,
             "possible": margin > 0 and size * price >= MIN_NOTIONAL,
             "open": AUTO_OPEN_ON_LLM_FALLBACK and rank <= MAX_ORDERS_PER_CYCLE and confidence >= MIN_CONFIDENCE,
-            "reason": "Fallback watch-only momentum signal because NVIDIA LLM did not return a usable response.",
+            "reason": "Fallback watch-only momentum signal because no LLM provider returned a usable response.",
             "price": price,
         })
     return signals
+
+def extract_json_array(text):
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    raw = text[start:end + 1]
+    attempts = [
+        raw,
+        re.sub(r",\s*([}\]])", r"\1", raw),
+        re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', re.sub(r",\s*([}\]])", r"\1", raw)),
+    ]
+    last_error = None
+    for candidate in attempts:
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, list) else []
+        except Exception as e:
+            last_error = e
+    logger.error(f"Signal parse error: {last_error}")
+    return []
 
 def analyze_top_signals(tickers, balance, force_open=False):
     market_rows = []
@@ -1170,6 +1306,8 @@ Rules:
 9. The per-pair and side history shown above is net of fees. A pair or specific side with avg PnL near zero or negative over multiple trades is a fee-eating churn.
 10. Prefer pairs with clearly positive recent avg net PnL on the exact LONG/SHORT side you propose.
 11. Mark OPEN YES for at most {max_open_signals} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade, unless FORCE TRADE MODE is active.
+12. Profitability target: only mark OPEN true when the setup is good enough to plausibly win about {AUTO_OPEN_TARGET_WIN_RATE:.0f}% of similar trades after fees. Skip marginal setups even if they are ranked highly.
+13. OPEN true should usually have confidence >= {AUTO_OPEN_CONFIDENCE_SCALPING if TRADE_MODE == "scalping" else AUTO_OPEN_CONFIDENCE_NORMAL}. Lower confidence is for WATCH only.
 
 Respond ONLY valid JSON:
 [
@@ -1181,35 +1319,31 @@ Respond ONLY valid JSON:
     if not response:
         logger.warning("Using fallback signal ranking because LLM returned no response")
         return analyze_top_signals_fallback(tickers, balance)
-    try:
-        start, end = response.find("["), response.rfind("]")
-        if start == -1 or end == -1: return []
-        raw_signals = json.loads(response[start:end + 1])
-        signals = []
-        for item in raw_signals:
-            symbol = str(item.get("symbol", "")).upper()
-            direction = str(item.get("direction", "")).upper()
-            if symbol not in ticker_map or direction not in ["LONG", "SHORT"]: continue
-            leverage = max(MIN_LEVERAGE, min(MAX_LEVERAGE, parse_int(item.get("leverage"), MIN_LEVERAGE)))
-            signal = {
-                "rank": parse_int(item.get("rank"), len(signals) + 1),
-                "symbol": symbol,
-                "direction": direction,
-                "confidence": parse_int(item.get("confidence"), 0),
-                "leverage": leverage,
-                "margin_usdt": parse_float(item.get("margin_usdt"), 0.0),
-                "size": parse_float(item.get("size"), 0.0),
-                "possible": parse_bool(item.get("possible", False)),
-                "open": parse_bool(item.get("open", False)),
-                "reason": str(item.get("reason", ""))[:220],
-                "price": parse_float(ticker_map[symbol].get("lastPr")),
-            }
-            signals.append(signal)
-            if len(signals) >= TOP_SIGNAL_COUNT: break
-        return signals
-    except Exception as e:
-        logger.error(f"Signal parse error: {e}")
-        return []
+    raw_signals = extract_json_array(response)
+    signals = []
+    for item in raw_signals:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol", "")).upper()
+        direction = str(item.get("direction", "")).upper()
+        if symbol not in ticker_map or direction not in ["LONG", "SHORT"]: continue
+        leverage = max(MIN_LEVERAGE, min(MAX_LEVERAGE, parse_int(item.get("leverage"), MIN_LEVERAGE)))
+        signal = {
+            "rank": parse_int(item.get("rank"), len(signals) + 1),
+            "symbol": symbol,
+            "direction": direction,
+            "confidence": parse_int(item.get("confidence"), 0),
+            "leverage": leverage,
+            "margin_usdt": parse_float(item.get("margin_usdt"), 0.0),
+            "size": parse_float(item.get("size"), 0.0),
+            "possible": parse_bool(item.get("possible", False)),
+            "open": parse_bool(item.get("open", False)),
+            "reason": str(item.get("reason", ""))[:220],
+            "price": parse_float(ticker_map[symbol].get("lastPr")),
+        }
+        signals.append(signal)
+        if len(signals) >= TOP_SIGNAL_COUNT: break
+    return signals
 
 def send_top_signals(signals, balance, open_count):
     if not signals:
@@ -1278,7 +1412,8 @@ def calculate_position_size(balance, signal, entry_price):
     target_notional = MIN_NOTIONAL * 1.03
     confidence = parse_int(signal.get("confidence"), 0)
     leverage_cap = risk_leverage_cap(confidence)
-    margin_cap = min(balance * MAX_MARGIN_PER_TRADE_FRACTION, max(0.0, balance - MIN_FREE_BALANCE_USDT))
+    margin_fraction = DRY_RUN_TARGET_MARGIN_PER_TRADE_FRACTION if DRY_RUN else MAX_MARGIN_PER_TRADE_FRACTION
+    margin_cap = min(balance * margin_fraction, max(0.0, balance - MIN_FREE_BALANCE_USDT))
     if margin_cap <= 0:
         return 0.0, 0.0, MIN_LEVERAGE
     min_required_leverage = math.ceil(target_notional / margin_cap)
@@ -1298,6 +1433,37 @@ def calculate_position_size(balance, signal, entry_price):
     if margin <= 0 or margin > balance or size <= 0:
         return 0.0, 0.0, leverage
     return normalize_order_size(size), margin, leverage
+
+def auto_entry_allowed(signal, symbol, leverage, side_has_edge=False, side_edge_stats=None):
+    confidence = parse_int(signal.get("confidence"), 0)
+    min_conf = AUTO_OPEN_CONFIDENCE_SCALPING if TRADE_MODE == "scalping" else AUTO_OPEN_CONFIDENCE_NORMAL
+    recent_stats = get_recent_trade_stats()
+    if (
+        recent_stats["total"] >= RECENT_PROFIT_MIN_TRADES
+        and (recent_stats["avg_pnl"] <= 0 or recent_stats["win_rate"] < RECENT_PROFIT_MIN_WIN_RATE)
+    ):
+        min_conf += RECENT_DEFENSE_CONFIDENCE_BONUS
+    if confidence < min_conf:
+        return False, f"confidence {confidence}% below auto-open threshold {min_conf}%"
+    rr = TAKE_PROFIT_ROI_PCT / max(STOP_LOSS_ROI_PCT, 0.01)
+    if rr < MIN_REWARD_RISK_RATIO:
+        return False, f"reward/risk {rr:.2f} below {MIN_REWARD_RISK_RATIO:.2f}"
+    if leverage > PROFIT_GUARD_MAX_LEVERAGE and confidence < PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE:
+        return False, f"leverage {leverage}x requires confidence >= {PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE}%"
+
+    pair_stats = get_pair_recent_stats(symbol)
+    side_stats = side_edge_stats or get_pair_direction_recent_stats(symbol, signal["direction"])
+    if pair_stats["total"] >= PAIR_NEGATIVE_EV_MIN_TRADES:
+        if pair_stats["avg_pnl"] <= 0 and not side_has_edge:
+            return False, f"pair avg net PnL {pair_stats['avg_pnl']:+.4f} is not positive"
+        if pair_stats["win_rate"] < PROFIT_GUARD_PAIR_MIN_WIN_RATE and not side_has_edge:
+            return False, f"pair win rate {pair_stats['win_rate']:.0f}% below {PROFIT_GUARD_PAIR_MIN_WIN_RATE:.0f}%"
+    if side_stats["total"] >= PROFIT_GUARD_SIDE_MIN_TRADES:
+        if side_stats["avg_pnl"] <= 0:
+            return False, f"{signal['direction']} side avg net PnL {side_stats['avg_pnl']:+.4f} is not positive"
+        if side_stats["win_rate"] < PROFIT_GUARD_SIDE_MIN_WIN_RATE:
+            return False, f"{signal['direction']} side win rate {side_stats['win_rate']:.0f}% below {PROFIT_GUARD_SIDE_MIN_WIN_RATE:.0f}%"
+    return True, ""
 
 def open_manual_trade(symbol, direction, margin_usdt=0.0, leverage=0):
     symbol = symbol.upper()
@@ -1553,20 +1719,26 @@ def find_and_trade():
         if opened >= max_to_open: break
         symbol = signal["symbol"]
         if symbol in existing_symbols: continue
+        side_has_edge, side_edge_stats = pair_direction_has_edge(symbol, signal["direction"])
         if force_open_requested:
             logger.warning(f"Force trade bypassing strategy filters for {symbol} {signal['direction']}")
-        elif symbol in blacklisted_pairs:
+        elif symbol in blacklisted_pairs and not side_has_edge:
             logger.info(f"Skipping {symbol} - blacklisted (loss rate >= {BLACKLIST_LOSS_RATE_PCT:.0f}%)")
             continue
-        if not force_open_requested and not direction_allowed(signal["direction"]):
+        if not force_open_requested and direction_cooldown_active(signal["direction"]):
+            logger.info(f"Skipping {symbol} {signal['direction']} - direction loss-streak cooldown active")
+            continue
+        if not force_open_requested and not direction_allowed(signal["direction"]) and not side_has_edge:
             logger.info(f"Skipping {symbol} {signal['direction']} - direction blocked by recent performance / cooldown")
             continue
+        if not force_open_requested and side_has_edge and not direction_allowed(signal["direction"]):
+            logger.info(f"Allowing {symbol} {signal['direction']} despite global direction block - pair+side edge (last {side_edge_stats['total']}: avg {side_edge_stats['avg_pnl']:+.4f} USDT, WR {side_edge_stats['win_rate']:.0f}%)")
         bad_side_ev, side_stats = pair_direction_negative_ev(symbol, signal["direction"])
         if not force_open_requested and bad_side_ev:
             logger.info(f"Skipping {symbol} {signal['direction']} - weak pair+side history (last {side_stats['total']}: avg {side_stats['avg_pnl']:+.4f} USDT, WR {side_stats['win_rate']:.0f}%)")
             continue
         bad_ev, ev_stats = pair_negative_ev(symbol)
-        if not force_open_requested and bad_ev:
+        if not force_open_requested and bad_ev and not side_has_edge:
             logger.info(f"Skipping {symbol} - negative EV (last {ev_stats['total']}: avg {ev_stats['avg_pnl']:+.4f} USDT, WR {ev_stats['win_rate']:.0f}%)")
             continue
         loss_streak, loss_streak_reason = pair_loss_streak_active(symbol)
@@ -1580,6 +1752,11 @@ def find_and_trade():
         if price <= 0 or size <= 0 or margin <= 0 or margin > balance or notional < MIN_NOTIONAL:
             logger.info(f"Skipping {symbol} - cannot meet minimum with balance/leverage")
             continue
+        if not force_open_requested:
+            allowed, guard_reason = auto_entry_allowed(signal, symbol, leverage, side_has_edge, side_edge_stats)
+            if not allowed:
+                logger.info(f"Skipping {symbol} {signal['direction']} - profit guard: {guard_reason}")
+                continue
         decision, confidence, reasoning = signal["direction"], signal["confidence"], signal["reason"]
         hold_side = "long" if decision == "LONG" else "short"
         side = "buy" if decision == "LONG" else "sell"
@@ -1744,7 +1921,7 @@ def handle_history(chat_id):
         send_telegram_buttons(f"📈 <b>Trade History</b>\n\nTotal trades: <b>{summary['total_trades']}</b>\nWin rate: <b>{summary['win_rate']}</b>\nAvg PnL: <b>{summary['avg_pnl']} USDT</b>\nBest pair: <b>{summary['best_pair']}</b>\nWorst pair: <b>{summary['worst_pair']}</b>\n\n<b>Last 10 Trades:</b>\n{summary['last_10']}", [["🔙 Menu", "menu:main"]], chat_id)
 
 def handle_commands():
-    global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, LLM_PROVIDER, DRY_RUN
+    global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, TOKENROUTER_MODEL, LLM_PROVIDER, DRY_RUN
     logger.info("Telegram handler started")
     while bot_running:
         try:
@@ -1763,21 +1940,29 @@ def handle_commands():
                         if len(parts) == 3:
                             _, prov, idx_str = parts
                             idx = int(idx_str)
-                            if prov == "n":
-                                all_m = [LLM_MODEL] + LLM_FALLBACK_MODELS
+                            provider = LLM_PROVIDER_BY_CODE.get(prov, "nvidia")
+                            if provider == "nvidia":
+                                all_m = provider_model_list(provider)
                                 if 0 <= idx < len(all_m):
                                     new_m = all_m[idx]
                                     if new_m != LLM_MODEL:
                                         LLM_MODEL = new_m
                                         logger.info(f"Model changed to {LLM_MODEL}")
-                            elif prov == "v":
-                                all_m = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
+                            elif provider == "virtuals":
+                                all_m = provider_model_list(provider)
                                 if 0 <= idx < len(all_m):
                                     new_m = all_m[idx]
                                     if new_m != VIRTUALS_MODEL:
                                         VIRTUALS_MODEL = new_m
                                         logger.info(f"Virtuals model changed to {VIRTUALS_MODEL}")
-                        edit_message_buttons(chat_id, msg_id, f"🧠 Model ({LLM_PROVIDER.upper()})\nCurrent: <code>{LLM_MODEL if LLM_PROVIDER=='nvidia' else VIRTUALS_MODEL}</code>", [["🔙 Menu", "menu:main"]])
+                            elif provider == "tokenrouter":
+                                all_m = provider_model_list(provider)
+                                if 0 <= idx < len(all_m):
+                                    new_m = all_m[idx]
+                                    if new_m != TOKENROUTER_MODEL:
+                                        TOKENROUTER_MODEL = new_m
+                                        logger.info(f"TokenRouter model changed to {TOKENROUTER_MODEL}")
+                        edit_message_buttons(chat_id, msg_id, f"🧠 Model ({LLM_PROVIDER_LABELS[LLM_PROVIDER]})\nCurrent: <code>{active_llm_model()}</code>", [["🔙 Menu", "menu:main"]])
                         answer_callback(cb_id)
                         continue
                     if cb_data == "menu:main":
@@ -1813,31 +1998,20 @@ def handle_commands():
                         continue
                     if cb_data == "menu:model":
                         answer_callback(cb_id)
-                        if LLM_PROVIDER == "virtuals":
-                            all_m = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
-                            primary = VIRTUALS_MODEL
-                            prov = "v"
-                        else:
-                            all_m = [LLM_MODEL] + LLM_FALLBACK_MODELS
-                            primary = LLM_MODEL
-                            prov = "n"
+                        all_m = provider_model_list(LLM_PROVIDER)
+                        primary = provider_primary_model(LLM_PROVIDER)
+                        prov = LLM_PROVIDER_CODES[LLM_PROVIDER]
                         btns = []
                         for i, m in enumerate(all_m):
                             active = " ✅" if m == primary else ""
                             short = m.split("/")[-1].split("-")[0] if "/" in m else m.split("-")[0]
                             btns.append([(f"{i+1}. {short}{active}", f"mdl:{prov}:{i}")])
                         btns.append([("🔙 Menu", "menu:main")])
-                        edit_message_buttons(chat_id, msg_id, f"🧠 <b>Model ({LLM_PROVIDER.upper()})</b>\nCurrent: <code>{primary}</code>", btns)
+                        edit_message_buttons(chat_id, msg_id, f"🧠 <b>Model ({LLM_PROVIDER_LABELS[LLM_PROVIDER]})</b>\nCurrent: <code>{primary}</code>", btns)
                         continue
                     if cb_data == "menu:provider":
                         answer_callback(cb_id)
-                        active = LLM_PROVIDER
-                        btns = [
-                            [("NVIDIA ✅" if active == "nvidia" else "NVIDIA", "prov:nvidia")],
-                            [("VIRTUALS ✅" if active == "virtuals" else "VIRTUALS", "prov:virtuals")],
-                            [("🔙 Menu", "menu:main")],
-                        ]
-                        edit_message_buttons(chat_id, msg_id, f"🔌 <b>LLM Provider</b>\nCurrent: <b>{active.upper()}</b>", btns)
+                        edit_message_buttons(chat_id, msg_id, f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>", provider_button_rows())
                         continue
                     if cb_data == "menu:paper":
                         answer_callback(cb_id)
@@ -1880,7 +2054,7 @@ def handle_commands():
                             f"🛑 <b>Stop</b> — matikan bot\n\n"
                             f"<b>Settings:</b>\n"
                             f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
-                            f"Provider: <b>{LLM_PROVIDER.upper()}</b>\n"
+                            f"Provider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\n"
                             f"Mode: {TRADE_MODE.upper()}\n"
                             f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                             f"Scan: every {SLEEP_MINUTES} min"
@@ -1889,15 +2063,14 @@ def handle_commands():
                         continue
                     if cb_data.startswith("prov:"):
                         val = cb_data.split(":")[1]
+                        if val not in SUPPORTED_LLM_PROVIDERS:
+                            answer_callback(cb_id, "Provider tidak dikenal")
+                            continue
                         if val != LLM_PROVIDER:
                             LLM_PROVIDER = val
                             logger.info(f"LLM provider changed to {LLM_PROVIDER}")
-                        answer_callback(cb_id, f"Provider: {val.upper()}")
-                        edit_message_buttons(chat_id, msg_id, f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER.upper()}</b>", [
-                            [("NVIDIA ✅" if LLM_PROVIDER == "nvidia" else "NVIDIA", "prov:nvidia")],
-                            [("VIRTUALS ✅" if LLM_PROVIDER == "virtuals" else "VIRTUALS", "prov:virtuals")],
-                            [("🔙 Menu", "menu:main")],
-                        ])
+                        answer_callback(cb_id, f"Provider: {LLM_PROVIDER_LABELS[val]}")
+                        edit_message_buttons(chat_id, msg_id, f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>", provider_button_rows())
                         continue
                     if cb_data.startswith("paper:"):
                         val = cb_data.split(":")[1]
@@ -1976,14 +2149,9 @@ def handle_commands():
                     consecutive_loss_cooldown_until = 0
                     send_telegram(f"⚡ <b>Force trade requested</b>\nBypassing learning filters/cooldowns and opening max <b>{FORCE_TRADE_ORDERS_PER_COMMAND}</b> pair if hard order limits allow it. Auto max positions stay <b>{MAX_POSITIONS}</b>.")
                 elif text == "/model":
-                    if LLM_PROVIDER == "virtuals":
-                        all_m = [VIRTUALS_MODEL] + VIRTUALS_FALLBACK_MODELS
-                        primary = VIRTUALS_MODEL
-                        prov = "v"
-                    else:
-                        all_m = [LLM_MODEL] + LLM_FALLBACK_MODELS
-                        primary = LLM_MODEL
-                        prov = "n"
+                    all_m = provider_model_list(LLM_PROVIDER)
+                    primary = provider_primary_model(LLM_PROVIDER)
+                    prov = LLM_PROVIDER_CODES[LLM_PROVIDER]
                     buttons = []
                     for i, m in enumerate(all_m):
                         active = " ✅" if m == primary else ""
@@ -1991,7 +2159,7 @@ def handle_commands():
                         label = f"{i+1}. {short}{active}"
                         buttons.append([(label, f"mdl:{prov}:{i}")])
                     send_telegram_buttons(
-                        f"🧠 <b>Model ({LLM_PROVIDER.upper()})</b>\nCurrent: <code>{primary}</code>",
+                        f"🧠 <b>Model ({LLM_PROVIDER_LABELS[LLM_PROVIDER]})</b>\nCurrent: <code>{primary}</code>",
                         buttons)
                 elif text.startswith("/mode"):
                     parts = text.split()
@@ -2014,21 +2182,24 @@ def handle_commands():
                 elif text.startswith("/provider"):
                     parts = text.split()
                     if len(parts) == 1:
-                        send_telegram(f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER.upper()}</b>\nAvailable: <b>NVIDIA</b>, <b>VIRTUALS</b>\nUse /provider nvidia atau /provider virtuals")
+                        available = ", ".join(f"<b>{label}</b>" for label in LLM_PROVIDER_LABELS.values())
+                        send_telegram(f"🔌 <b>LLM Provider</b>\nCurrent: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\nAvailable: {available}\nUse /provider nvidia, /provider virtuals, atau /provider tokenrouter")
                     else:
                         requested = parts[1].strip().lower()
                         if requested in ("nvidia", "nv"):
                             new_val = "nvidia"
                         elif requested in ("virtuals", "virtual", "vrt"):
                             new_val = "virtuals"
+                        elif requested in ("tokenrouter", "token", "router", "tok3nrouter", "tr"):
+                            new_val = "tokenrouter"
                         else:
-                            send_telegram("⚠️ Provider tidak dikenal. Pilih: /provider nvidia atau /provider virtuals")
+                            send_telegram("⚠️ Provider tidak dikenal. Pilih: /provider nvidia, /provider virtuals, atau /provider tokenrouter")
                             continue
                         if new_val == LLM_PROVIDER:
-                            send_telegram(f"✅ Provider sudah <b>{LLM_PROVIDER.upper()}</b>.")
+                            send_telegram(f"✅ Provider sudah <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>.")
                         else:
                             LLM_PROVIDER = new_val
-                            send_telegram(f"✅ Provider diganti ke <b>{LLM_PROVIDER.upper()}</b>.\nBot akan coba <b>{LLM_PROVIDER.upper()}</b> dulu di siklus berikutnya.")
+                            send_telegram(f"✅ Provider diganti ke <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>.\nBot akan coba <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b> dulu di siklus berikutnya.")
                             logger.info(f"LLM provider changed to {LLM_PROVIDER}")
                 elif text.startswith("/paper"):
                     parts = text.split()
@@ -2103,7 +2274,7 @@ def handle_commands():
                         f"🛑 Stop — matikan bot\n\n"
                         f"<b>Settings:</b>\n"
                         f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
-                        f"Provider: <b>{LLM_PROVIDER.upper()}</b>\n"
+                        f"Provider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\n"
                         f"Mode: {TRADE_MODE.upper()}\n"
                         f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                         f"Scan: every {SLEEP_MINUTES} min",
@@ -2116,7 +2287,7 @@ def handle_commands():
 def main():
     global bot_running
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
-    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER.upper()}</b>\nModel: <code>{LLM_MODEL if LLM_PROVIDER=='nvidia' else VIRTUALS_MODEL}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}%</b> | SL: <b>{STOP_LOSS_ROI_PCT:.0f}%</b>", main_menu())
+    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\nModel: <code>{active_llm_model()}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}%</b> | SL: <b>{STOP_LOSS_ROI_PCT:.0f}%</b>", main_menu())
     init_db()
     cleanup_stale_dry_run_positions()
     t = threading.Thread(target=handle_commands, daemon=True)
