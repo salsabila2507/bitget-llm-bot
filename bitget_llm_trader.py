@@ -1041,9 +1041,12 @@ def send_telegram_buttons(msg, buttons, chat_id=None):
                     for row in buttons
                 ]
             }
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": cid, "text": msg, "parse_mode": "HTML", "reply_markup": reply_markup}, timeout=10)
-        except: pass
+            if r.status_code != 200:
+                logger.error(f"sendMessage failed (chat {cid}): {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            logger.error(f"sendMessage error (chat {cid}): {e}")
 
 def edit_message_buttons(chat_id, message_id, msg, buttons):
     try:
@@ -1053,9 +1056,12 @@ def edit_message_buttons(chat_id, message_id, msg, buttons):
                 for row in buttons
             ]
         }
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
             json={"chat_id": chat_id, "message_id": message_id, "text": msg, "parse_mode": "HTML", "reply_markup": reply_markup}, timeout=10)
-    except: pass
+        if r.status_code != 200:
+            logger.error(f"editMessageText failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"editMessageText error: {e}")
 
 def main_menu():
     return [
@@ -1069,9 +1075,12 @@ def main_menu():
 
 def answer_callback(callback_query_id, text=""):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
             json={"callback_query_id": callback_query_id, "text": text}, timeout=10)
-    except: pass
+        if r.status_code != 200:
+            logger.error(f"answerCallbackQuery failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"answerCallbackQuery error: {e}")
 
 def get_telegram_updates():
     global last_update_id
@@ -1983,7 +1992,7 @@ def handle_status(chat_id):
     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
     mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
     if not positions:
-        send_telegram_buttons(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>", [["🔙 Menu", "menu:main"]], chat_id)
+        send_telegram_buttons(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>", [[("🔙 Menu", "menu:main")]], chat_id)
     else:
         lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
         for p in positions:
@@ -2000,20 +2009,20 @@ def handle_status(chat_id):
             pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
             lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
         lines.append("")
-        send_telegram_buttons("\n\n".join(lines), [["🔙 Menu", "menu:main"]], chat_id)
+        send_telegram_buttons("\n\n".join(lines), [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_balance(chat_id):
     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
     real_balance = get_balance() if DRY_RUN else balance
     mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
-    send_telegram_buttons(f"💰 <b>Balance</b>\nMode: <b>{mode}</b>\nAvailable: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>", [["🔙 Menu", "menu:main"]], chat_id)
+    send_telegram_buttons(f"💰 <b>Balance</b>\nMode: <b>{mode}</b>\nAvailable: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>", [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_history(chat_id):
     summary = get_trade_summary()
     if not summary:
-        send_telegram_buttons("📈 Belum ada trade history.", [["🔙 Menu", "menu:main"]], chat_id)
+        send_telegram_buttons("📈 Belum ada trade history.", [[("🔙 Menu", "menu:main")]], chat_id)
     else:
-        send_telegram_buttons(f"📈 <b>Trade History</b>\n\nTotal trades: <b>{summary['total_trades']}</b>\nWin rate: <b>{summary['win_rate']}</b>\nAvg PnL: <b>{summary['avg_pnl']} USDT</b>\nBest pair: <b>{summary['best_pair']}</b>\nWorst pair: <b>{summary['worst_pair']}</b>\n\n<b>Last 10 Trades:</b>\n{summary['last_10']}", [["🔙 Menu", "menu:main"]], chat_id)
+        send_telegram_buttons(f"📈 <b>Trade History</b>\n\nTotal trades: <b>{summary['total_trades']}</b>\nWin rate: <b>{summary['win_rate']}</b>\nAvg PnL: <b>{summary['avg_pnl']} USDT</b>\nBest pair: <b>{summary['best_pair']}</b>\nWorst pair: <b>{summary['worst_pair']}</b>\n\n<b>Last 10 Trades:</b>\n{summary['last_10']}", [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_commands():
     global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, TOKENROUTER_MODEL, LLM_PROVIDER, DRY_RUN
@@ -2025,7 +2034,9 @@ def handle_commands():
                 cb = u.get("callback_query")
                 if cb:
                     chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    logger.debug(f"CB from {chat_id}: data={cb.get('data','')}")
                     if chat_id not in TELEGRAM_CHAT_IDS:
+                        logger.debug(f"CB chat_id {chat_id} not in TELEGRAM_CHAT_IDS, skipping")
                         continue
                     cb_data = cb.get("data", "")
                     cb_id = cb.get("id", "")
@@ -2057,7 +2068,7 @@ def handle_commands():
                                     if new_m != TOKENROUTER_MODEL:
                                         TOKENROUTER_MODEL = new_m
                                         logger.info(f"TokenRouter model changed to {TOKENROUTER_MODEL}")
-                        edit_message_buttons(chat_id, msg_id, f"🧠 Model ({LLM_PROVIDER_LABELS[LLM_PROVIDER]})\nCurrent: <code>{active_llm_model()}</code>", [["🔙 Menu", "menu:main"]])
+                        edit_message_buttons(chat_id, msg_id, f"🧠 Model ({LLM_PROVIDER_LABELS[LLM_PROVIDER]})\nCurrent: <code>{active_llm_model()}</code>", [[("🔙 Menu", "menu:main")]])
                         answer_callback(cb_id)
                         continue
                     if cb_data == "menu:main":
@@ -2154,7 +2165,7 @@ def handle_commands():
                             f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                             f"Scan: every {SLEEP_MINUTES} min"
                         )
-                        edit_message_buttons(chat_id, msg_id, msg, [["🔙 Menu", "menu:main"]])
+                        edit_message_buttons(chat_id, msg_id, msg, [[("🔙 Menu", "menu:main")]])
                         continue
                     if cb_data.startswith("prov:"):
                         val = cb_data.split(":")[1]
@@ -2377,7 +2388,7 @@ def handle_commands():
                         f"Mode: {TRADE_MODE.upper()}\n"
                         f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                         f"Scan: every {SLEEP_MINUTES} min",
-                        [["🔙 Menu", "menu:main"]])
+                        [[("🔙 Menu", "menu:main")]])
             time.sleep(1)
         except Exception as e:
             logger.error(f"handle_commands error: {e}")
