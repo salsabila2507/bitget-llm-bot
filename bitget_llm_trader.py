@@ -1139,7 +1139,7 @@ def llm_request_payload(provider, model, prompt):
     return {
         "model": model,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 1800,
+        "max_tokens": 4096,
     }
 
 def _try_llm_provider(prompt, name, base_url, api_key, models):
@@ -1422,6 +1422,20 @@ Respond ONLY valid JSON:
     if not response:
         logger.warning("Using fallback signal ranking because LLM returned no response")
         return analyze_top_signals_fallback(tickers, balance)
+    logger.info(f"LLM raw response (first 800): {response[:800]}")
+    logger.info(f"Response type={type(response).__name__}, len={len(response)}, first_char_ord={ord(response[0]) if response else -1}, last_5_chars={repr(response[-5:])}")
+    # Direct JSON parse test
+    try:
+        direct = json.loads(response)
+        logger.info(f"Direct json.loads OK: type={type(direct).__name__}, len={len(direct) if isinstance(direct, (list,dict)) else 'N/A'}")
+    except Exception as e:
+        logger.error(f"Direct json.loads failed: {e}")
+    try:
+        d = json.JSONDecoder()
+        p, e = d.raw_decode(response)
+        logger.info(f"raw_decode OK: type={type(p).__name__}, end={e}")
+    except Exception as e:
+        logger.error(f"raw_decode failed: {e}")
     raw_signals = extract_json_array(response)
     signals = []
     for item in raw_signals:
