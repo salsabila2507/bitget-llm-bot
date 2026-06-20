@@ -437,7 +437,20 @@ def get_position_counts():
     return all_positions, auto_positions, manual_count
 
 def get_strategy_balance():
-    return DRY_RUN_BALANCE if DRY_RUN else get_balance()
+    if not DRY_RUN:
+        return get_balance()
+    closed_pnl = 0.0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("SELECT SUM(pnl) FROM trades WHERE closed_at IS NOT NULL AND pnl IS NOT NULL AND action NOT LIKE 'STALE_%'")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            closed_pnl = row[0]
+    except:
+        pass
+    open_pnl = get_open_dry_run_net_pnl()
+    return DRY_RUN_BALANCE + closed_pnl + open_pnl
 
 def get_trade_summary():
     try:
@@ -1990,26 +2003,27 @@ def manage_positions():
 def handle_status(chat_id):
     positions, auto_positions, manual_count = get_position_counts()
     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
+    real_balance = get_balance() if DRY_RUN else balance
     mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
     if not positions:
-        send_telegram_buttons(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>", [[("🔙 Menu", "menu:main")]], chat_id)
-    else:
-        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
-        for p in positions:
-            entry = parse_float(p.get("openPriceAvg", 0), 0.0)
-            hold_side = normalize_hold_side(p.get("holdSide", "long"))
-            if DRY_RUN:
-                ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
-                current = parse_float(ticker.get("lastPr"), entry)
-                pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
-            else:
-                current = parse_float(p.get("markPrice", 0), 0.0)
-                pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
-            emoji = "🟢" if pnl > 0 else "🔴"
-            pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
-            lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
-        lines.append("")
-        send_telegram_buttons("\n\n".join(lines), [[("🔙 Menu", "menu:main")]], chat_id)
+        send_telegram_buttons(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>", [[("🔙 Menu", "menu:main")]], chat_id)
+        return
+    lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
+    for p in positions:
+        entry = parse_float(p.get("openPriceAvg", 0), 0.0)
+        hold_side = normalize_hold_side(p.get("holdSide", "long"))
+        if DRY_RUN:
+            ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
+            current = parse_float(ticker.get("lastPr"), entry)
+            pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+        else:
+            current = parse_float(p.get("markPrice", 0), 0.0)
+            pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
+        emoji = "🟢" if pnl > 0 else "🔴"
+        pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
+        lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+    lines.append("")
+    send_telegram_buttons("\n\n".join(lines), [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_balance(chat_id):
     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
@@ -2034,9 +2048,7 @@ def handle_commands():
                 cb = u.get("callback_query")
                 if cb:
                     chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-                    logger.debug(f"CB from {chat_id}: data={cb.get('data','')}")
                     if chat_id not in TELEGRAM_CHAT_IDS:
-                        logger.debug(f"CB chat_id {chat_id} not in TELEGRAM_CHAT_IDS, skipping")
                         continue
                     cb_data = cb.get("data", "")
                     cb_id = cb.get("id", "")
@@ -2214,11 +2226,12 @@ def handle_commands():
                 if text == "/status":
                     positions, auto_positions, manual_count = get_position_counts()
                     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
+                    real_balance = get_balance() if DRY_RUN else balance
                     mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
                     if not positions:
-                        send_telegram(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
+                        send_telegram(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
                     else:
-                        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
+                        lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
                         for p in positions:
                             entry = parse_float(p.get("openPriceAvg", 0), 0.0)
                             hold_side = normalize_hold_side(p.get("holdSide", "long"))
