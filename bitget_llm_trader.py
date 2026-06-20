@@ -98,6 +98,7 @@ TELEGRAM_CHAT_IDS = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", TELE
 DRY_RUN = env_bool("DRY_RUN", env_bool("BITGET_DRY_RUN", True))
 DRY_RUN_BALANCE = env_float("DRY_RUN_BALANCE", 5.0)
 DRY_RUN_POLL_SECONDS = env_int("DRY_RUN_POLL_SECONDS", 15)
+LLM_MANAGE_ENTRY = env_bool("LLM_MANAGE_ENTRY", True)
 TRADE_MODE = os.environ.get("TRADE_MODE", os.environ.get("BITGET_TRADE_MODE", "scalping")).strip().lower()
 TAKER_FEE_RATE = 0.0006
 LLM_ERROR_COOLDOWN_SECONDS = 300
@@ -1077,13 +1078,14 @@ def edit_message_buttons(chat_id, message_id, msg, buttons):
         logger.error(f"editMessageText error: {e}")
 
 def main_menu():
+    entry_label = "🤖 Auto TP/SL ✅" if LLM_MANAGE_ENTRY else "🤖 Auto TP/SL ❌"
     return [
         [("📊 Status", "menu:status"), ("💰 Balance", "menu:balance")],
         [("📈 History", "menu:history"), ("⚡ Trade", "menu:trade")],
         [("⚡ Force", "menu:forcetrade"), ("🧠 Model", "menu:model")],
         [("🔌 Provider", "menu:provider"), ("📄 Paper/Live", "menu:paper")],
-        [("⚙️ Mode", "menu:mode"), ("🛑 Stop", "menu:stop")],
-        [("📋 Help", "menu:help")],
+        [("⚙️ Mode", "menu:mode"), (entry_label, "menu:entrymode")],
+        [("🛑 Stop", "menu:stop"), ("📋 Help", "menu:help")],
     ]
 
 def answer_callback(callback_query_id, text=""):
@@ -1873,7 +1875,7 @@ def find_and_trade():
         side = "buy" if decision == "LONG" else "sell"
         tp_price = signal.get("tp_price", 0.0)
         sl_price = signal.get("sl_price", 0.0)
-        if tp_price <= 0 or sl_price <= 0:
+        if not LLM_MANAGE_ENTRY or tp_price <= 0 or sl_price <= 0:
             tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage)
         if DRY_RUN:
             dry_action = f"DRY_{decision}"
@@ -2052,7 +2054,7 @@ def handle_history(chat_id):
         send_telegram_buttons(f"📈 <b>Trade History</b>\n\nTotal trades: <b>{summary['total_trades']}</b>\nWin rate: <b>{summary['win_rate']}</b>\nAvg PnL: <b>{summary['avg_pnl']} USDT</b>\nBest pair: <b>{summary['best_pair']}</b>\nWorst pair: <b>{summary['worst_pair']}</b>\n\n<b>Last 10 Trades:</b>\n{summary['last_10']}", [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_commands():
-    global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, TOKENROUTER_MODEL, LLM_PROVIDER, DRY_RUN
+    global bot_running, force_trade, force_open_trade, consecutive_losses, consecutive_loss_cooldown_until, LLM_MODEL, VIRTUALS_MODEL, TOKENROUTER_MODEL, LLM_PROVIDER, DRY_RUN, LLM_MANAGE_ENTRY
     logger.info("Telegram handler started")
     while bot_running:
         try:
@@ -2164,6 +2166,16 @@ def handle_commands():
                         ]
                         edit_message_buttons(chat_id, msg_id, f"⚙️ <b>Trading Mode</b>\nCurrent: <b>{active.upper()}</b>", btns)
                         continue
+                    if cb_data == "menu:entrymode":
+                        LLM_MANAGE_ENTRY = not LLM_MANAGE_ENTRY
+                        logger.info(f"LLM entry mode toggled to {'autopilot' if LLM_MANAGE_ENTRY else 'manual TP/SL'}")
+                        answer_callback(cb_id, f"Auto TP/SL: {'ON' if LLM_MANAGE_ENTRY else 'OFF'}")
+                        label = "🤖 Auto TP/SL ✅" if LLM_MANAGE_ENTRY else "🤖 Auto TP/SL ❌"
+                        edit_message_buttons(chat_id, msg_id, f"🤖 <b>Entry Mode</b>\nCurrent: <b>{'Autopilot (LLM sets TP/SL)' if LLM_MANAGE_ENTRY else 'Manual (bot calculates TP/SL)'}</b>", [
+                            [(label, "menu:entrymode")],
+                            [("🔙 Menu", "menu:main")],
+                        ])
+                        continue
                     if cb_data == "menu:stop":
                         answer_callback(cb_id, "🛑 Stopping bot...")
                         send_telegram("🛑 Bot stopped.")
@@ -2182,11 +2194,13 @@ def handle_commands():
                             f"🔌 <b>Provider</b> — ganti LLM provider\n"
                             f"📄 <b>Paper/Live</b> — ganti mode trading\n"
                             f"⚙️ <b>Mode</b> — scalping / normal\n"
+                            f"🤖 <b>Auto TP/SL</b> — LLM atur TP/SL atau manual\n"
                             f"🛑 <b>Stop</b> — matikan bot\n\n"
                             f"<b>Settings:</b>\n"
                             f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
                             f"Provider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\n"
                             f"Mode: {TRADE_MODE.upper()}\n"
+                            f"Auto TP/SL: {'✅' if LLM_MANAGE_ENTRY else '❌'}\n"
                             f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                             f"Scan: every {SLEEP_MINUTES} min"
                         )
@@ -2407,11 +2421,13 @@ def handle_commands():
                         f"🔌 Provider — ganti LLM provider\n"
                         f"📄 Paper/Live — ganti mode trading\n"
                         f"⚙️ Mode — scalping / normal\n"
+                        f"🤖 Auto TP/SL — LLM atur TP/SL atau manual\n"
                         f"🛑 Stop — matikan bot\n\n"
                         f"<b>Settings:</b>\n"
                         f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
                         f"Provider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\n"
                         f"Mode: {TRADE_MODE.upper()}\n"
+                        f"Auto TP/SL: {'✅' if LLM_MANAGE_ENTRY else '❌'}\n"
                         f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                         f"Scan: every {SLEEP_MINUTES} min",
                         [[("🔙 Menu", "menu:main")]])
@@ -2423,7 +2439,7 @@ def handle_commands():
 def main():
     global bot_running
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
-    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\nModel: <code>{active_llm_model()}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}%</b> | SL: <b>{STOP_LOSS_ROI_PCT:.0f}%</b>", main_menu())
+    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\nModel: <code>{active_llm_model()}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nAuto TP/SL: <b>{'✅' if LLM_MANAGE_ENTRY else '❌'}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}%</b> | SL: <b>{STOP_LOSS_ROI_PCT:.0f}%</b>", main_menu())
     init_db()
     cleanup_stale_dry_run_positions()
     t = threading.Thread(target=handle_commands, daemon=True)
