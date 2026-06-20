@@ -1408,10 +1408,11 @@ Rules:
 11. Mark OPEN YES for at most {max_open_signals} pairs. If no candidate has clear edge, return them with OPEN false rather than forcing a trade, unless FORCE TRADE MODE is active.
 12. Profitability target: only mark OPEN true when the setup is good enough to plausibly win about {AUTO_OPEN_TARGET_WIN_RATE:.0f}% of similar trades after fees. Skip marginal setups even if they are ranked highly.
 13. OPEN true should usually have confidence >= {AUTO_OPEN_CONFIDENCE_SCALPING if TRADE_MODE == "scalping" else AUTO_OPEN_CONFIDENCE_NORMAL}. Lower confidence is for WATCH only.
+14. Set tp_price and sl_price based on your own analysis. tp_price is the take-profit exit price, sl_price is the stop-loss exit price. These must be on the correct side of entry (tp above entry for LONG, below for SHORT; sl below entry for LONG, above for SHORT).
 
 Respond ONLY valid JSON:
 [
-  {{"rank":1,"symbol":"BTCUSDT","direction":"LONG","confidence":84,"leverage":4,"margin_usdt":1.4,"size":0.00006,"possible":true,"open":true,"reason":"brief"}},
+  {{"rank":1,"symbol":"BTCUSDT","direction":"LONG","confidence":84,"leverage":4,"margin_usdt":1.4,"size":0.00006,"possible":true,"open":true,"tp_price":67500.0,"sl_price":65000.0,"reason":"brief"}},
   ...
 ]
 """
@@ -1440,6 +1441,8 @@ Respond ONLY valid JSON:
             "open": parse_bool(item.get("open", False)),
             "reason": str(item.get("reason", ""))[:220],
             "price": parse_float(ticker_map[symbol].get("lastPr")),
+            "tp_price": parse_float(item.get("tp_price"), 0.0),
+            "sl_price": parse_float(item.get("sl_price"), 0.0),
         }
         signals.append(signal)
         if len(signals) >= TOP_SIGNAL_COUNT: break
@@ -1453,9 +1456,12 @@ def send_top_signals(signals, balance, open_count):
     for s in signals:
         possible = "OK" if s["possible"] else "NO"
         open_mark = "OPEN" if s["open"] else "WATCH"
+        tp_str = f" TP: {s['tp_price']}" if s.get('tp_price') else ""
+        sl_str = f" SL: {s['sl_price']}" if s.get('sl_price') else ""
         lines.append(
             f"{s['rank']}. <b>{s['symbol']}</b> {s['direction']} | Conf: <b>{s['confidence']}%</b> | "
-            f"Lev: <b>{s['leverage']}x</b> | Margin: <b>{s['margin_usdt']:.4f}</b> | {possible}/{open_mark}\n"
+            f"Lev: <b>{s['leverage']}x</b> | Margin: <b>{s['margin_usdt']:.4f}</b> | {possible}/{open_mark}"
+            f"{tp_str}{sl_str}\n"
             f"{s['reason']}"
         )
     send_telegram("\n\n".join(lines))
@@ -1865,16 +1871,21 @@ def find_and_trade():
         decision, confidence, reasoning = signal["direction"], signal["confidence"], signal["reason"]
         hold_side = "long" if decision == "LONG" else "short"
         side = "buy" if decision == "LONG" else "sell"
-        tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage)
+        tp_price = signal.get("tp_price", 0.0)
+        sl_price = signal.get("sl_price", 0.0)
+        if tp_price <= 0 or sl_price <= 0:
+            tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage)
         if DRY_RUN:
             dry_action = f"DRY_{decision}"
             save_trade_open(symbol, dry_action, price, size, leverage, confidence)
             last_trade_time = time.time()
+            tp_roi = ((tp_price - price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((price - tp_price) / price * 100 * leverage) if price > 0 else 0
+            sl_roi = ((price - sl_price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((sl_price - price) / price * 100 * leverage) if price > 0 else 0
             msg = (f"🧪 <b>DRY RUN {decision} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
                    f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
                    f"Leverage: <b>{leverage}x</b>\nConfidence: <b>{confidence}%</b>\n"
-                   f"TP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b> @ <b>{tp_price}</b>\n"
-                   f"SL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b> @ <b>{sl_price}</b>\n"
+                   f"TP: <b>{tp_roi:+.2f}%</b> @ <b>{tp_price}</b>\n"
+                   f"SL: <b>{sl_roi:+.2f}%</b> @ <b>{sl_price}</b>\n"
                    f"Fee model: <b>{TAKER_FEE_RATE * 100:.2f}% taker each side</b>\n\n💡 {reasoning}")
             send_telegram(msg)
             logger.info(f"DRY RUN opened {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
@@ -1889,11 +1900,13 @@ def find_and_trade():
         if res.get("code") == "00000":
             save_trade_open(symbol, decision, price, size, leverage, confidence)
             last_trade_time = time.time()
+            tp_roi = ((tp_price - price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((price - tp_price) / price * 100 * leverage) if price > 0 else 0
+            sl_roi = ((price - sl_price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((sl_price - price) / price * 100 * leverage) if price > 0 else 0
             msg = (f"🟢 <b>{decision} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
                    f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
                    f"Leverage: <b>{leverage}x</b>\nConfidence: <b>{confidence}%</b>\n"
-                   f"TP: <b>{TAKE_PROFIT_ROI_PCT:.0f}% ROI</b> @ <b>{tp_price}</b>\n"
-                   f"SL: <b>{STOP_LOSS_ROI_PCT:.0f}% ROI</b> @ <b>{sl_price}</b>\n\n💡 {reasoning}")
+                   f"TP: <b>{tp_roi:+.2f}%</b> @ <b>{tp_price}</b>\n"
+                   f"SL: <b>{sl_roi:+.2f}%</b> @ <b>{sl_price}</b>\n\n💡 {reasoning}")
             send_telegram(msg)
             logger.info(f"Opened {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
             opened += 1
