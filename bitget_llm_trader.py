@@ -1,4 +1,4 @@
-import os, sys, subprocess, time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3, re
+import os, sys, subprocess, time, logging, json, requests, hmac, hashlib, base64, math, threading, sqlite3, re, ast
 from datetime import datetime
 from collections import defaultdict
 
@@ -53,7 +53,7 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_MODEL = os.environ.get("NVIDIA_LLM_MODEL", "meta/llama-4-maverick-17b-128e-instruct")
 VIRTUALS_API_KEY = os.environ.get("VIRTUALS_API_KEY", "")
 VIRTUALS_BASE_URL = "https://compute.virtuals.io/v1"
-VIRTUALS_MODEL = os.environ.get("VIRTUALS_MODEL", "deepseek-v4-flash")
+VIRTUALS_MODEL = os.environ.get("VIRTUALS_MODEL", "anthropic-claude-opus-4-8")
 TOKENROUTER_API_KEY = os.environ.get("TOKENROUTER_API_KEY", "")
 TOKENROUTER_BASE_URL = os.environ.get("TOKENROUTER_BASE_URL", "https://api.tokenrouter.com/v1").rstrip("/")
 TOKENROUTER_MODEL = os.environ.get("TOKENROUTER_MODEL", "MiniMax-M3")
@@ -64,10 +64,14 @@ LLM_FALLBACK_MODELS = [
     "meta/llama-3.3-70b-instruct",
 ]
 VIRTUALS_FALLBACK_MODELS = [
-    "gemini-3-flash-preview",
-    "openai-gpt-55",
-    "deepseek-v4-pro",
+    "anthropic-claude-opus-4-8-fast",
+    "anthropic-claude-sonnet-4-6",
     "openai-gpt-55-pro",
+    "openai-gpt-55",
+    "google-gemini-3-1-pro-preview",
+    "deepseek-deepseek-v4-pro",
+    "deepseek-deepseek-v4-flash",
+    "google-gemini-3-flash-preview",
 ]
 TOKENROUTER_FALLBACK_MODELS = []
 LLM_PROVIDER_LABELS = {
@@ -98,6 +102,8 @@ TRADE_MODE = os.environ.get("TRADE_MODE", os.environ.get("BITGET_TRADE_MODE", "s
 TAKER_FEE_RATE = 0.0006
 LLM_ERROR_COOLDOWN_SECONDS = 300
 LLM_REQUEST_TIMEOUT_SECONDS = 30
+LLM_TIMEOUT_MODEL_COOLDOWN_SECONDS = env_int("LLM_TIMEOUT_MODEL_COOLDOWN_SECONDS", 300)
+LLM_FAILURE_MODEL_COOLDOWN_SECONDS = env_int("LLM_FAILURE_MODEL_COOLDOWN_SECONDS", 120)
 RECENT_TRADE_LIMIT = 20
 DIRECTION_MIN_TRADES = 5
 DIRECTION_BLOCK_WIN_RATE = 55.0
@@ -112,7 +118,7 @@ PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD = 0.0
 PAIR_DIRECTION_MIN_TRADES = 2
 PAIR_DIRECTION_BLOCK_WIN_RATE = 50.0
 PAIR_DIRECTION_EDGE_MIN_TRADES = env_int("PAIR_DIRECTION_EDGE_MIN_TRADES", 3)
-PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 60.0)
+PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 80.0)
 PAIR_DIRECTION_EDGE_MIN_AVG_PNL = env_float("PAIR_DIRECTION_EDGE_MIN_AVG_PNL", 0.0)
 PAIR_LOSS_STREAK_LIMIT = 2
 PAIR_LOSS_STREAK_COOLDOWN_HOURS = 12
@@ -147,8 +153,8 @@ TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (
 TRAILING_ACTIVATE_ROI_PCT = 8.0 if TRADE_MODE == "scalping" else 20.0
 MIN_TRAILING_PROFIT_ROI_PCT = 5.0 if TRADE_MODE == "scalping" else 10.0
 CONSECUTIVE_LOSS_LIMIT = 3
-AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 88)
-AUTO_OPEN_CONFIDENCE_NORMAL = env_int("AUTO_OPEN_CONFIDENCE_NORMAL", 82)
+AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 90)
+AUTO_OPEN_CONFIDENCE_NORMAL = env_int("AUTO_OPEN_CONFIDENCE_NORMAL", 88)
 RECENT_PROFIT_WINDOW = env_int("RECENT_PROFIT_WINDOW", 10)
 RECENT_PROFIT_MIN_TRADES = env_int("RECENT_PROFIT_MIN_TRADES", 5)
 RECENT_PROFIT_MIN_WIN_RATE = env_float("RECENT_PROFIT_MIN_WIN_RATE", 60.0)
@@ -158,8 +164,9 @@ MIN_REWARD_RISK_RATIO = env_float("MIN_REWARD_RISK_RATIO", 1.35)
 PROFIT_GUARD_MAX_LEVERAGE = env_int("PROFIT_GUARD_MAX_LEVERAGE", 4)
 PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE = env_int("PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE", 92)
 PROFIT_GUARD_SIDE_MIN_TRADES = env_int("PROFIT_GUARD_SIDE_MIN_TRADES", 2)
-PROFIT_GUARD_SIDE_MIN_WIN_RATE = env_float("PROFIT_GUARD_SIDE_MIN_WIN_RATE", 55.0)
-PROFIT_GUARD_PAIR_MIN_WIN_RATE = env_float("PROFIT_GUARD_PAIR_MIN_WIN_RATE", 50.0)
+PROFIT_GUARD_SIDE_MIN_WIN_RATE = env_float("PROFIT_GUARD_SIDE_MIN_WIN_RATE", AUTO_OPEN_TARGET_WIN_RATE)
+PROFIT_GUARD_PAIR_MIN_WIN_RATE = env_float("PROFIT_GUARD_PAIR_MIN_WIN_RATE", AUTO_OPEN_TARGET_WIN_RATE)
+PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE = env_int("PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE", 92)
 TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
 DB_PATH = "/root/trade_history.db"
@@ -335,7 +342,11 @@ def is_manual_action(action):
 
 def direction_from_action(action):
     action = str(action).upper()
-    return "long" if "LONG" in action else "short"
+    if "LONG" in action:
+        return "long"
+    if "SHORT" in action:
+        return "short"
+    return "long"
 
 def action_direction(action):
     action = str(action).upper()
@@ -348,7 +359,14 @@ def action_direction(action):
 def position_state_key(symbol, hold_side):
     return f"{symbol}:{str(hold_side).lower()}"
 
+def normalize_hold_side(hold_side):
+    hold_side = str(hold_side or "").strip().lower()
+    if hold_side in ("short", "sell"):
+        return "short"
+    return "long"
+
 def clear_trailing_stop(symbol, hold_side):
+    hold_side = normalize_hold_side(hold_side)
     trailing_stops.pop(position_state_key(symbol, hold_side), None)
     trailing_stops.pop(symbol, None)
 
@@ -401,7 +419,7 @@ def get_open_manual_position_keys():
             WHERE closed_at IS NULL AND action IN ('DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT', 'MANUAL_LONG', 'MANUAL_SHORT')""")
         rows = cur.fetchall()
         conn.close()
-        return {(symbol, direction_from_action(action)) for symbol, action in rows}
+        return {(symbol, normalize_hold_side(direction_from_action(action))) for symbol, action in rows}
     except:
         return set()
 
@@ -410,7 +428,7 @@ def get_auto_strategy_positions():
     if DRY_RUN:
         return [p for p in positions if not is_manual_action(p.get("action", ""))]
     manual_keys = get_open_manual_position_keys()
-    return [p for p in positions if (p.get("symbol"), p.get("holdSide", "long")) not in manual_keys]
+    return [p for p in positions if (p.get("symbol"), normalize_hold_side(p.get("holdSide", "long"))) not in manual_keys]
 
 def get_position_counts():
     all_positions = get_strategy_positions()
@@ -485,6 +503,7 @@ def estimate_round_trip_fee(entry_price, exit_price, size):
     return (entry_notional + exit_notional) * TAKER_FEE_RATE
 
 def calculate_net_pnl(entry_price, exit_price, size, hold_side):
+    hold_side = normalize_hold_side(hold_side)
     gross = (exit_price - entry_price) * size if hold_side == "long" else (entry_price - exit_price) * size
     fee = estimate_round_trip_fee(entry_price, exit_price, size)
     return gross - fee, fee
@@ -946,25 +965,64 @@ def place_order(symbol, side, size, hold_side="long", tp_price=None, sl_price=No
     return api_post("/api/v2/mix/order/place-order", body)
 
 def close_position_api(symbol, hold_side="long"):
+    hold_side = normalize_hold_side(hold_side)
     body = {"symbol": symbol, "productType": PRODUCT_TYPE, "holdSide": hold_side}
     return api_post("/api/v2/mix/order/close-positions", body)
+
+def close_position_succeeded(res, symbol, hold_side):
+    """Bitget flash-close may return code 00000 with per-symbol failures."""
+    if res.get("code") != "00000":
+        return False, res.get("msg", "API returned non-success code")
+    data = res.get("data") or {}
+    if not isinstance(data, dict):
+        return True, ""
+    symbol = str(symbol).upper()
+    hold_side = normalize_hold_side(hold_side)
+    failures = data.get("failureList") or data.get("failureList".lower()) or []
+    if isinstance(failures, dict):
+        failures = [failures]
+    for item in failures:
+        if not isinstance(item, dict):
+            continue
+        item_symbol = str(item.get("symbol", "")).upper()
+        item_side = normalize_hold_side(item.get("holdSide", hold_side))
+        if (not item_symbol or item_symbol == symbol) and item_side == hold_side:
+            reason = item.get("errorMsg") or item.get("msg") or item.get("errorCode") or "close failed"
+            return False, str(reason)
+    successes = data.get("successList") or data.get("successList".lower()) or []
+    if isinstance(successes, dict):
+        successes = [successes]
+    if successes:
+        for item in successes:
+            if not isinstance(item, dict):
+                continue
+            item_symbol = str(item.get("symbol", "")).upper()
+            item_side = normalize_hold_side(item.get("holdSide", hold_side))
+            if (not item_symbol or item_symbol == symbol) and item_side == hold_side:
+                return True, ""
+        return False, "symbol/side missing from close successList"
+    return True, ""
 
 def close_all_positions():
     positions = get_strategy_positions() if DRY_RUN else get_positions()
     for p in positions:
-        symbol, hold = p["symbol"], p.get("holdSide", "long")
-        price = float(p.get("markPrice", p.get("openPriceAvg", 0)))
+        symbol, hold = p["symbol"], normalize_hold_side(p.get("holdSide", "long"))
+        price = parse_float(p.get("markPrice", p.get("openPriceAvg", 0)), 0.0)
         pnl, fee, size, current, entry = estimate_position_net_pnl(p, price)
         if DRY_RUN:
             res = {"code": "00000"}
         else:
             res = close_position_api(symbol, hold)
-        if res.get("code") == "00000":
+        ok, close_reason = close_position_succeeded(res, symbol, hold)
+        if ok:
             save_trade_close_by_id(p["id"], price, pnl) if DRY_RUN else save_trade_close(symbol, price, pnl, hold)
             emoji = "✅" if pnl > 0 else "❌"
             prefix = "DRY RUN " if DRY_RUN else ""
             send_telegram(f"{emoji} <b>{prefix}CLOSED</b> {hold.upper()} {symbol}\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
             logger.info(f"{prefix}Closed {hold} {symbol} | Net PnL: {pnl:.4f} | Fee: {fee:.4f}")
+        else:
+            send_telegram(f"⚠️ Failed to close {hold.upper()} {symbol}: {close_reason}")
+            logger.error(f"Close failed for {hold} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
 
 def send_telegram(msg):
     for chat_id in TELEGRAM_CHAT_IDS:
@@ -1095,6 +1153,7 @@ def _try_llm_provider(prompt, name, base_url, api_key, models):
                         time.sleep(5)
                         continue
                 elif status >= 500:
+                    llm_model_cooldowns[model] = time.time() + LLM_FAILURE_MODEL_COOLDOWN_SECONDS
                     network_failures += 1
                     if attempt == 0:
                         logger.warning(f"LLM {model} server error; retrying after 3s")
@@ -1103,6 +1162,7 @@ def _try_llm_provider(prompt, name, base_url, api_key, models):
                 break
             except requests.exceptions.Timeout:
                 logger.error(f"LLM timeout on {model}")
+                llm_model_cooldowns[model] = time.time() + LLM_TIMEOUT_MODEL_COOLDOWN_SECONDS
                 network_failures += 1
                 if attempt == 0:
                     logger.warning(f"Retrying {model} after timeout")
@@ -1225,22 +1285,40 @@ def analyze_top_signals_fallback(tickers, balance):
 
 def extract_json_array(text):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        return []
-    raw = text[start:end + 1]
-    attempts = [
-        raw,
-        re.sub(r",\s*([}\]])", r"\1", raw),
-        re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', re.sub(r",\s*([}\]])", r"\1", raw)),
-    ]
-    last_error = None
-    for candidate in attempts:
+    candidates = []
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\[", text):
+        fragment = text[match.start():]
         try:
-            parsed = json.loads(candidate)
-            return parsed if isinstance(parsed, list) else []
-        except Exception as e:
-            last_error = e
+            parsed, end = decoder.raw_decode(fragment)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    candidates.extend(fenced)
+    last_error = None
+    for raw in candidates:
+        cleaned = raw.strip()
+        attempts = [
+            cleaned,
+            re.sub(r",\s*([}\]])", r"\1", cleaned),
+            re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', re.sub(r",\s*([}\]])", r"\1", cleaned)),
+        ]
+        for candidate in attempts:
+            try:
+                parsed = json.loads(candidate)
+                return parsed if isinstance(parsed, list) else []
+            except Exception as e:
+                last_error = e
+            try:
+                parsed = ast.literal_eval(candidate)
+                return parsed if isinstance(parsed, list) else []
+            except Exception as e:
+                last_error = e
     logger.error(f"Signal parse error: {last_error}")
     return []
 
@@ -1453,6 +1531,10 @@ def auto_entry_allowed(signal, symbol, leverage, side_has_edge=False, side_edge_
 
     pair_stats = get_pair_recent_stats(symbol)
     side_stats = side_edge_stats or get_pair_direction_recent_stats(symbol, signal["direction"])
+    if pair_stats["total"] == 0 and side_stats["total"] == 0 and confidence < PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE:
+        return False, f"no pair/side history; requires confidence >= {PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE}%"
+    if side_stats["total"] > 0 and side_stats["win_rate"] < AUTO_OPEN_TARGET_WIN_RATE and not side_has_edge:
+        return False, f"{signal['direction']} side win rate {side_stats['win_rate']:.0f}% below target {AUTO_OPEN_TARGET_WIN_RATE:.0f}%"
     if pair_stats["total"] >= PAIR_NEGATIVE_EV_MIN_TRADES:
         if pair_stats["avg_pnl"] <= 0 and not side_has_edge:
             return False, f"pair avg net PnL {pair_stats['avg_pnl']:+.4f} is not positive"
@@ -1520,6 +1602,7 @@ def open_manual_trade(symbol, direction, margin_usdt=0.0, leverage=0):
         logger.error(f"Manual order failed for {symbol}: {res.get('msg')}")
 
 def calculate_roi_prices(entry_price, hold_side, leverage):
+    hold_side = normalize_hold_side(hold_side)
     price_move_tp = TAKE_PROFIT_ROI_PCT / (leverage * 100)
     price_move_sl = STOP_LOSS_ROI_PCT / (leverage * 100)
     if hold_side == "long":
@@ -1597,10 +1680,10 @@ LEVERAGE: {MIN_LEVERAGE}-{MAX_LEVERAGE}
 
 def calculate_position_roi_pct(position):
     entry_price = parse_float(position.get("openPriceAvg"), 0.0)
-    current_price = float(position.get("markPrice", entry_price))
+    current_price = parse_float(position.get("markPrice", entry_price), entry_price)
     leverage = max(1, parse_int(position.get("leverage"), MIN_LEVERAGE))
     size = get_position_size_value(position)
-    hold_side = position.get("holdSide", "long")
+    hold_side = normalize_hold_side(position.get("holdSide", "long"))
     if entry_price <= 0 or current_price <= 0 or size <= 0: return 0.0
     gross_pnl = (current_price - entry_price) * size if hold_side == "long" else (entry_price - current_price) * size
     fee = estimate_round_trip_fee(entry_price, current_price, size)
@@ -1640,7 +1723,7 @@ def get_position_size_value(position):
 def estimate_position_net_pnl(position, current_price=None):
     entry_price = parse_float(position.get("openPriceAvg"), 0.0)
     current_price = parse_float(current_price, 0.0) if current_price is not None else parse_float(position.get("markPrice", entry_price), entry_price)
-    hold_side = position.get("holdSide", "long")
+    hold_side = normalize_hold_side(position.get("holdSide", "long"))
     size = get_position_size_value(position)
     if entry_price <= 0 or current_price <= 0 or size <= 0:
         return 0.0, 0.0, 0.0, current_price, size
@@ -1812,7 +1895,10 @@ def manage_positions():
     positions = get_strategy_positions()
     if not positions: return
     for p in positions:
-        symbol, hold_side, entry = p["symbol"], p.get("holdSide", "long"), float(p.get("openPriceAvg", 0))
+        symbol = p["symbol"]
+        hold_side = normalize_hold_side(p.get("holdSide", "long"))
+        p["holdSide"] = hold_side
+        entry = parse_float(p.get("openPriceAvg", 0), 0.0)
         trail_key = position_state_key(symbol, hold_side)
         if DRY_RUN:
             ticker = next((t for t in get_tickers() if t.get("symbol") == symbol), {})
@@ -1824,13 +1910,14 @@ def manage_positions():
             p["unrealizedPL"] = pnl
             p["leverage"] = leverage
         else:
-            current = float(p.get("markPrice", 0))
+            current = parse_float(p.get("markPrice", 0), 0.0)
             net_pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
-            pnl = net_pnl if size > 0 else float(p.get("unrealizedPL", 0))
+            pnl = net_pnl if size > 0 else parse_float(p.get("unrealizedPL", 0), 0.0)
         roi_pct = calculate_position_roi_pct(p)
         if roi_pct >= TAKE_PROFIT_ROI_PCT:
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
-            if res.get("code") == "00000":
+            ok, close_reason = close_position_succeeded(res, symbol, hold_side)
+            if ok:
                 save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
                 clear_trailing_stop(symbol, hold_side)
                 consecutive_losses = 0
@@ -1838,9 +1925,11 @@ def manage_positions():
                 send_telegram(f"✅ <b>{prefix}TAKE PROFIT</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>+{roi_pct:.2f}%</b>\nNet PnL: <b>+{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                 logger.info(f"{prefix}TP hit {symbol} | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f} | Fee: {fee:.4f}")
                 continue
+            logger.error(f"TP close failed for {hold_side} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
         if check_stop_loss(p, entry):
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
-            if res.get("code") == "00000":
+            ok, close_reason = close_position_succeeded(res, symbol, hold_side)
+            if ok:
                 save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
                 clear_trailing_stop(symbol, hold_side)
                 consecutive_losses += 1
@@ -1853,9 +1942,11 @@ def manage_positions():
                     logger.warning(f"Consecutive loss limit hit ({consecutive_losses}); cooldown {CONSECUTIVE_LOSS_COOLDOWN_MIN} min")
                     consecutive_losses = 0
                 continue
+            logger.error(f"SL close failed for {hold_side} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
         if check_trailing_stop(trail_key, roi_pct):
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
-            if res.get("code") == "00000":
+            ok, close_reason = close_position_succeeded(res, symbol, hold_side)
+            if ok:
                 save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
                 peak = trailing_stops.pop(trail_key, roi_pct)
                 trailing_stops.pop(symbol, None)
@@ -1868,10 +1959,12 @@ def manage_positions():
                 send_telegram(f"{emoji} <b>{prefix}TRAILING STOP</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nPeak ROI: <b>+{peak:.2f}%</b> → Now: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                 logger.info(f"{prefix}Trailing stop hit {symbol} | Peak ROI: {peak:.2f}% | Exit ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f}")
                 continue
+            logger.error(f"Trailing close failed for {hold_side} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
         age_hours = position_age_hours(p)
         if MAX_HOLD_HOURS > 0 and age_hours >= MAX_HOLD_HOURS:
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
-            if res.get("code") == "00000":
+            ok, close_reason = close_position_succeeded(res, symbol, hold_side)
+            if ok:
                 save_trade_close_by_id(p["id"], current, pnl) if DRY_RUN else save_trade_close(symbol, current, pnl, hold_side)
                 clear_trailing_stop(symbol, hold_side)
                 if pnl <= 0:
@@ -1883,6 +1976,7 @@ def manage_positions():
                 send_telegram(f"{emoji} <b>{prefix}TIME STOP</b>\n{hold_side.upper()} {symbol}\nHeld: <b>{age_hours:.1f}h</b> (limit {MAX_HOLD_HOURS}h)\nEntry: {entry:.6f} → Exit: {current:.6f}\nNet ROI: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                 logger.info(f"{prefix}Time stop {symbol} | Age: {age_hours:.1f}h | Net ROI: {roi_pct:.2f}% | Net PnL: {pnl:.4f}")
                 continue
+            logger.error(f"Time-stop close failed for {hold_side} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
 
 def handle_status(chat_id):
     positions, auto_positions, manual_count = get_position_counts()
@@ -1893,17 +1987,18 @@ def handle_status(chat_id):
     else:
         lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
         for p in positions:
-            entry = float(p.get("openPriceAvg", 0))
+            entry = parse_float(p.get("openPriceAvg", 0), 0.0)
+            hold_side = normalize_hold_side(p.get("holdSide", "long"))
             if DRY_RUN:
                 ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
                 current = parse_float(ticker.get("lastPr"), entry)
                 pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
             else:
-                current = float(p.get("markPrice", 0))
+                current = parse_float(p.get("markPrice", 0), 0.0)
                 pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
             emoji = "🟢" if pnl > 0 else "🔴"
-            pnl_pct = ((current - entry) / entry * 100) if p.get("holdSide") == "long" else ((entry - current) / entry * 100)
-            lines.append(f"{emoji} {p.get('holdSide','').upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+            pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
+            lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
         lines.append("")
         send_telegram_buttons("\n\n".join(lines), [["🔙 Menu", "menu:main"]], chat_id)
 
@@ -2114,17 +2209,18 @@ def handle_commands():
                     else:
                         lines = [f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>{len(auto_positions)}/{MAX_POSITIONS}</b>\nManual positions: <b>{manual_count}</b>\nConsecutive losses: <b>{consecutive_losses}</b>\n"]
                         for p in positions:
-                            entry = float(p.get("openPriceAvg", 0))
+                            entry = parse_float(p.get("openPriceAvg", 0), 0.0)
+                            hold_side = normalize_hold_side(p.get("holdSide", "long"))
                             if DRY_RUN:
                                 ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
                                 current = parse_float(ticker.get("lastPr"), entry)
                                 pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
                             else:
-                                current = float(p.get("markPrice", 0))
+                                current = parse_float(p.get("markPrice", 0), 0.0)
                                 pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
                             emoji = "🟢" if pnl > 0 else "🔴"
-                            pnl_pct = ((current - entry) / entry * 100) if p.get("holdSide") == "long" else ((entry - current) / entry * 100)
-                            lines.append(f"{emoji} {p.get('holdSide','').upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+                            pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
+                            lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                         send_telegram("\n\n".join(lines))
                 elif text == "/balance":
                     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
@@ -2245,17 +2341,20 @@ def handle_commands():
                             send_telegram(f"⚠️ No position for {sym}")
                         else:
                             hold = pos.get("holdSide", "long")
-                            price = float(pos.get("markPrice", pos.get("openPriceAvg", 0)))
+                            hold = normalize_hold_side(hold)
+                            price = parse_float(pos.get("markPrice", pos.get("openPriceAvg", 0)), 0.0)
                             pnl, fee, size, current, entry = estimate_position_net_pnl(pos, price)
                             res = {"code": "00000"} if DRY_RUN else close_position_api(sym, hold)
-                            if res.get("code") == "00000":
+                            ok, close_reason = close_position_succeeded(res, sym, hold)
+                            if ok:
                                 save_trade_close_by_id(pos["id"], price, pnl) if DRY_RUN else save_trade_close(sym, price, pnl, hold)
                                 clear_trailing_stop(sym, hold)
                                 emoji = "✅" if pnl > 0 else "❌"
                                 prefix = "DRY RUN " if DRY_RUN else ""
                                 send_telegram(f"{emoji} <b>{prefix}CLOSED</b> {hold.upper()} {sym}\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                             else:
-                                send_telegram(f"⚠️ Failed to close {sym}: {res.get('msg')}")
+                                send_telegram(f"⚠️ Failed to close {hold.upper()} {sym}: {close_reason}")
+                                logger.error(f"Manual close failed for {hold} {sym}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
                 elif text == "/stop":
                     send_telegram("🛑 Bot stopped.")
                     bot_running = False
@@ -2302,10 +2401,10 @@ def main():
                 for p in positions:
                     if DRY_RUN:
                         ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
-                        entry = float(p.get("openPriceAvg", 0))
+                        entry = parse_float(p.get("openPriceAvg", 0), 0.0)
                         pnl, fee, size, current, entry = estimate_position_net_pnl(p, parse_float(ticker.get("lastPr"), entry))
                     else:
-                        pnl, fee, size, current, entry = estimate_position_net_pnl(p, float(p.get("markPrice", 0)))
+                        pnl, fee, size, current, entry = estimate_position_net_pnl(p, parse_float(p.get("markPrice", 0), 0.0))
                     logger.info(f"Position: {p.get('holdSide','').upper()} {p['symbol']} | Net PnL: {pnl:.4f} | Est. fees: {fee:.4f}")
                 manage_positions()
             find_and_trade()
