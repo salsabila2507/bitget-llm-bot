@@ -1464,8 +1464,10 @@ Respond ONLY valid JSON:
         if len(signals) >= TOP_SIGNAL_COUNT: break
     return signals
 
-def send_top_signals(signals, balance, open_count):
+def send_top_signals(signals, balance, open_count, force=False):
     if not signals:
+        if force:
+            send_telegram("❌ <b>No valid signals</b>\nLLM returned no valid signals or parsing failed. Check logs.")
         logger.info("No valid signals returned this cycle.")
         return
     lines = [f"📊 <b>Top {len(signals)} signals</b>\nBalance: <b>{balance:.4f} USDT</b>\nOpen positions: <b>{open_count}/{MAX_POSITIONS}</b>"]
@@ -1825,7 +1827,7 @@ def find_and_trade():
     check_and_apply_loss_streak_cooldowns()
     signals = analyze_top_signals(candidates, balance, force_open_requested)
     if force_open_requested:
-        send_top_signals(signals, balance, len(positions))
+        send_top_signals(signals, balance, len(positions), force=True)
     else:
         maybe_send_top_signals(signals, balance, len(positions))
     force_trade = False
