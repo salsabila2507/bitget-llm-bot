@@ -119,7 +119,7 @@ PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD = 0.0
 PAIR_DIRECTION_MIN_TRADES = 2
 PAIR_DIRECTION_BLOCK_WIN_RATE = 50.0
 PAIR_DIRECTION_EDGE_MIN_TRADES = env_int("PAIR_DIRECTION_EDGE_MIN_TRADES", 3)
-PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 80.0)
+PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 60.0)
 PAIR_DIRECTION_EDGE_MIN_AVG_PNL = env_float("PAIR_DIRECTION_EDGE_MIN_AVG_PNL", 0.0)
 PAIR_LOSS_STREAK_LIMIT = 2
 PAIR_LOSS_STREAK_COOLDOWN_HOURS = 12
@@ -154,13 +154,13 @@ TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (
 TRAILING_ACTIVATE_ROI_PCT = 8.0 if TRADE_MODE == "scalping" else 20.0
 MIN_TRAILING_PROFIT_ROI_PCT = 5.0 if TRADE_MODE == "scalping" else 10.0
 CONSECUTIVE_LOSS_LIMIT = 3
-AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 90)
-AUTO_OPEN_CONFIDENCE_NORMAL = env_int("AUTO_OPEN_CONFIDENCE_NORMAL", 88)
+AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 85)
+AUTO_OPEN_CONFIDENCE_NORMAL = env_int("AUTO_OPEN_CONFIDENCE_NORMAL", 83)
 RECENT_PROFIT_WINDOW = env_int("RECENT_PROFIT_WINDOW", 10)
 RECENT_PROFIT_MIN_TRADES = env_int("RECENT_PROFIT_MIN_TRADES", 5)
 RECENT_PROFIT_MIN_WIN_RATE = env_float("RECENT_PROFIT_MIN_WIN_RATE", 60.0)
 RECENT_DEFENSE_CONFIDENCE_BONUS = env_int("RECENT_DEFENSE_CONFIDENCE_BONUS", 4)
-AUTO_OPEN_TARGET_WIN_RATE = env_float("AUTO_OPEN_TARGET_WIN_RATE", 80.0)
+AUTO_OPEN_TARGET_WIN_RATE = env_float("AUTO_OPEN_TARGET_WIN_RATE", 60.0)
 MIN_REWARD_RISK_RATIO = env_float("MIN_REWARD_RISK_RATIO", 1.35)
 PROFIT_GUARD_MAX_LEVERAGE = env_int("PROFIT_GUARD_MAX_LEVERAGE", 4)
 PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE = env_int("PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE", 92)
@@ -506,10 +506,7 @@ def get_open_dry_run_net_pnl():
         return 0.0
 
 def get_strategy_today_net_pnl():
-    pnl = get_today_pnl()
-    if DRY_RUN:
-        pnl += get_open_dry_run_net_pnl()
-    return pnl
+    return get_today_pnl()
 
 def estimate_round_trip_fee(entry_price, exit_price, size):
     entry_notional = abs(entry_price * size)
@@ -1779,6 +1776,9 @@ def estimate_position_net_pnl(position, current_price=None):
 def find_and_trade():
     global last_trade_time, force_trade, force_open_trade, daily_loss_locked_date, consecutive_loss_cooldown_until
     force_open_requested = force_open_trade
+    force_trade_requested = force_trade
+    force_trade = False
+    force_open_trade = False
     positions = get_auto_strategy_positions()
     balance = get_strategy_balance()
     today_net_pnl = get_strategy_today_net_pnl()
@@ -1803,7 +1803,7 @@ def find_and_trade():
             force_trade = False
             force_open_trade = False
             return
-    if not force_trade and last_trade_time and time.time() - last_trade_time < TRADE_COOLDOWN_MIN * 60:
+    if not force_trade_requested and last_trade_time and time.time() - last_trade_time < TRADE_COOLDOWN_MIN * 60:
         remaining = int(((TRADE_COOLDOWN_MIN * 60) - (time.time() - last_trade_time)) / 60) + 1
         logger.info(f"Trade cooldown active ({remaining} min left); skipping new entries")
         return
@@ -1830,8 +1830,6 @@ def find_and_trade():
         send_top_signals(signals, balance, len(positions), force=True)
     else:
         maybe_send_top_signals(signals, balance, len(positions))
-    force_trade = False
-    force_open_trade = False
     if len(positions) >= MAX_POSITIONS:
         logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}; signals only")
         if force_open_requested:
@@ -2007,6 +2005,11 @@ def manage_positions():
                     consecutive_losses += 1
                 else:
                     consecutive_losses = 0
+                if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+                    consecutive_loss_cooldown_until = time.time() + CONSECUTIVE_LOSS_COOLDOWN_MIN * 60
+                    send_telegram(f"⏸️ <b>Cooldown</b>\nReached {consecutive_losses} consecutive losses (limit {CONSECUTIVE_LOSS_LIMIT}).\nNew entries paused for <b>{CONSECUTIVE_LOSS_COOLDOWN_MIN} min</b>.")
+                    logger.warning(f"Consecutive loss limit hit ({consecutive_losses}); cooldown {CONSECUTIVE_LOSS_COOLDOWN_MIN} min")
+                    consecutive_losses = 0
                 prefix = "DRY RUN " if DRY_RUN else ""
                 emoji = "🔻" if pnl <= 0 else "✅"
                 send_telegram(f"{emoji} <b>{prefix}TRAILING STOP</b>\n{hold_side.upper()} {symbol}\nEntry: {entry:.6f} → Exit: {current:.6f}\nPeak ROI: <b>+{peak:.2f}%</b> → Now: <b>{roi_pct:.2f}%</b>\nNet PnL: <b>{pnl:.4f} USDT</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
@@ -2023,6 +2026,11 @@ def manage_positions():
                 if pnl <= 0:
                     consecutive_losses += 1
                 else:
+                    consecutive_losses = 0
+                if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+                    consecutive_loss_cooldown_until = time.time() + CONSECUTIVE_LOSS_COOLDOWN_MIN * 60
+                    send_telegram(f"⏸️ <b>Cooldown</b>\nReached {consecutive_losses} consecutive losses (limit {CONSECUTIVE_LOSS_LIMIT}).\nNew entries paused for <b>{CONSECUTIVE_LOSS_COOLDOWN_MIN} min</b>.")
+                    logger.warning(f"Consecutive loss limit hit ({consecutive_losses}); cooldown {CONSECUTIVE_LOSS_COOLDOWN_MIN} min")
                     consecutive_losses = 0
                 prefix = "DRY RUN " if DRY_RUN else ""
                 emoji = "⏱️" if pnl >= 0 else "⏱️🔻"
