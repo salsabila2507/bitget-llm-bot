@@ -119,7 +119,7 @@ PAIR_DIRECTION_NEGATIVE_EV_THRESHOLD = 0.0
 PAIR_DIRECTION_MIN_TRADES = 2
 PAIR_DIRECTION_BLOCK_WIN_RATE = 50.0
 PAIR_DIRECTION_EDGE_MIN_TRADES = env_int("PAIR_DIRECTION_EDGE_MIN_TRADES", 3)
-PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 60.0)
+PAIR_DIRECTION_EDGE_MIN_WIN_RATE = env_float("PAIR_DIRECTION_EDGE_MIN_WIN_RATE", 55.0)
 PAIR_DIRECTION_EDGE_MIN_AVG_PNL = env_float("PAIR_DIRECTION_EDGE_MIN_AVG_PNL", 0.0)
 PAIR_LOSS_STREAK_LIMIT = 2
 PAIR_LOSS_STREAK_COOLDOWN_HOURS = 12
@@ -160,13 +160,13 @@ RECENT_PROFIT_WINDOW = env_int("RECENT_PROFIT_WINDOW", 10)
 RECENT_PROFIT_MIN_TRADES = env_int("RECENT_PROFIT_MIN_TRADES", 5)
 RECENT_PROFIT_MIN_WIN_RATE = env_float("RECENT_PROFIT_MIN_WIN_RATE", 60.0)
 RECENT_DEFENSE_CONFIDENCE_BONUS = env_int("RECENT_DEFENSE_CONFIDENCE_BONUS", 4)
-AUTO_OPEN_TARGET_WIN_RATE = env_float("AUTO_OPEN_TARGET_WIN_RATE", 60.0)
+AUTO_OPEN_TARGET_WIN_RATE = env_float("AUTO_OPEN_TARGET_WIN_RATE", 65.0)
 MIN_REWARD_RISK_RATIO = env_float("MIN_REWARD_RISK_RATIO", 1.35)
 PROFIT_GUARD_MAX_LEVERAGE = env_int("PROFIT_GUARD_MAX_LEVERAGE", 4)
 PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE = env_int("PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE", 92)
 PROFIT_GUARD_SIDE_MIN_TRADES = env_int("PROFIT_GUARD_SIDE_MIN_TRADES", 2)
-PROFIT_GUARD_SIDE_MIN_WIN_RATE = env_float("PROFIT_GUARD_SIDE_MIN_WIN_RATE", AUTO_OPEN_TARGET_WIN_RATE)
-PROFIT_GUARD_PAIR_MIN_WIN_RATE = env_float("PROFIT_GUARD_PAIR_MIN_WIN_RATE", AUTO_OPEN_TARGET_WIN_RATE)
+PROFIT_GUARD_SIDE_MIN_WIN_RATE = env_float("PROFIT_GUARD_SIDE_MIN_WIN_RATE", 50.0)
+PROFIT_GUARD_PAIR_MIN_WIN_RATE = env_float("PROFIT_GUARD_PAIR_MIN_WIN_RATE", 55.0)
 PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE = env_int("PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE", 92)
 TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
@@ -1576,8 +1576,8 @@ def auto_entry_allowed(signal, symbol, leverage, side_has_edge=False, side_edge_
     side_stats = side_edge_stats or get_pair_direction_recent_stats(symbol, signal["direction"])
     if pair_stats["total"] == 0 and side_stats["total"] == 0 and confidence < PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE:
         return False, f"no pair/side history; requires confidence >= {PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE}%"
-    if side_stats["total"] > 0 and side_stats["win_rate"] < AUTO_OPEN_TARGET_WIN_RATE and not side_has_edge:
-        return False, f"{signal['direction']} side win rate {side_stats['win_rate']:.0f}% below target {AUTO_OPEN_TARGET_WIN_RATE:.0f}%"
+    if side_stats["total"] > 0 and side_stats["avg_pnl"] <= 0 and not side_has_edge:
+        return False, f"{signal['direction']} side avg net PnL {side_stats['avg_pnl']:+.4f} is not positive"
     if pair_stats["total"] >= PAIR_NEGATIVE_EV_MIN_TRADES:
         if pair_stats["avg_pnl"] <= 0 and not side_has_edge:
             return False, f"pair avg net PnL {pair_stats['avg_pnl']:+.4f} is not positive"
