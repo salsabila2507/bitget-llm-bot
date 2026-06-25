@@ -143,9 +143,11 @@ DRY_RUN_TARGET_MARGIN_PER_TRADE_FRACTION = env_float("DRY_RUN_TARGET_MARGIN_PER_
 MIN_FREE_BALANCE_USDT = 0.20
 MIN_LIQUIDATION_BUFFER_PCT = 5.0
 MARGIN_MODE, PRODUCT_TYPE, MARGIN_COIN = "isolated", "USDT-FUTURES", "USDT"
-SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" else 60
+MAX_SCALP_POSITIONS = max(0, env_int("MAX_SCALP_POSITIONS", 1))
+MAX_NORMAL_POSITIONS = max(0, env_int("MAX_NORMAL_POSITIONS", 1))
+SLEEP_MINUTES = 5 if TRADE_MODE == "scalping" or (MAX_SCALP_POSITIONS > 0) else 60
 
-MAX_POSITIONS = max(1, env_int("MAX_POSITIONS", env_int("MAX_PAIRS", 2)))
+MAX_POSITIONS = max(1, env_int("MAX_POSITIONS", env_int("MAX_PAIRS", MAX_SCALP_POSITIONS + MAX_NORMAL_POSITIONS)))
 MAX_ORDERS_PER_CYCLE = max(1, min(MAX_POSITIONS, env_int("MAX_ORDERS_PER_CYCLE", 1)))
 FORCE_TRADE_ORDERS_PER_COMMAND = 1
 TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT = (10.0, 6.0) if TRADE_MODE == "scalping" else (70.0, 40.0)
@@ -154,7 +156,7 @@ TRAILING_STOP_PCT, MIN_CONFIDENCE = (2.0, 80) if TRADE_MODE == "scalping" else (
 TRAILING_ACTIVATE_ROI_PCT = 8.0 if TRADE_MODE == "scalping" else 20.0
 MIN_TRAILING_PROFIT_ROI_PCT = 5.0 if TRADE_MODE == "scalping" else 10.0
 CONSECUTIVE_LOSS_LIMIT = 3
-AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 85)
+AUTO_OPEN_CONFIDENCE_SCALPING = env_int("AUTO_OPEN_CONFIDENCE_SCALPING", 84)
 AUTO_OPEN_CONFIDENCE_NORMAL = env_int("AUTO_OPEN_CONFIDENCE_NORMAL", 83)
 RECENT_PROFIT_WINDOW = env_int("RECENT_PROFIT_WINDOW", 10)
 RECENT_PROFIT_MIN_TRADES = env_int("RECENT_PROFIT_MIN_TRADES", 5)
@@ -167,7 +169,7 @@ PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE = env_int("PROFIT_GUARD_MAX_LEVERAGE_CONFID
 PROFIT_GUARD_SIDE_MIN_TRADES = env_int("PROFIT_GUARD_SIDE_MIN_TRADES", 2)
 PROFIT_GUARD_SIDE_MIN_WIN_RATE = env_float("PROFIT_GUARD_SIDE_MIN_WIN_RATE", 50.0)
 PROFIT_GUARD_PAIR_MIN_WIN_RATE = env_float("PROFIT_GUARD_PAIR_MIN_WIN_RATE", 55.0)
-PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE = env_int("PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE", 92)
+PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE = env_int("PROFIT_GUARD_UNKNOWN_HISTORY_CONFIDENCE", 84)
 TIMEFRAMES = ["15m", "1H", "4H"]
 SIGNAL_SCAN_COUNT, TOP_SIGNAL_COUNT = 50, 10
 DB_PATH = "/root/trade_history.db"
@@ -204,6 +206,13 @@ TRADE_PROFILES = {
         "min_confidence": 80,
     },
 }
+
+def get_profile_params(profile):
+    profile = str(profile or "scalping").strip().lower()
+    return TRADE_PROFILES.get(profile, TRADE_PROFILES["scalping"])
+
+def get_position_profile(position):
+    return str(position.get("profile", "scalping") or "scalping").strip().lower()
 
 def apply_trade_mode(mode):
     global TRADE_MODE, SLEEP_MINUTES, TAKE_PROFIT_ROI_PCT, STOP_LOSS_ROI_PCT, TRAILING_STOP_PCT, MIN_CONFIDENCE, TRAILING_ACTIVATE_ROI_PCT, MIN_TRAILING_PROFIT_ROI_PCT
@@ -248,13 +257,17 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, action TEXT, entry_price REAL,
         exit_price REAL, size REAL, pnl REAL, leverage INTEGER,
         confidence INTEGER, opened_at TEXT, closed_at TEXT)''')
-    conn.commit()
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN profile TEXT")
+        conn.commit()
+    except:
+        pass
     conn.close()
 
-def save_trade_open(symbol, action, entry_price, size, leverage, confidence):
+def save_trade_open(symbol, action, entry_price, size, leverage, confidence, profile="scalping"):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO trades (symbol, action, entry_price, size, leverage, confidence, opened_at) VALUES (?,?,?,?,?,?,?)",
-        (symbol, action, entry_price, size, leverage, confidence, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.execute("INSERT INTO trades (symbol, action, entry_price, size, leverage, confidence, opened_at, profile) VALUES (?,?,?,?,?,?,?,?)",
+        (symbol, action, entry_price, size, leverage, confidence, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile))
     conn.commit()
     conn.close()
 
@@ -298,7 +311,7 @@ def cleanup_stale_dry_run_positions():
         return
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence, opened_at
+        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence, opened_at, profile
             FROM trades
             WHERE closed_at IS NULL
               AND action IN ('LONG', 'SHORT', 'DRY_LONG', 'DRY_SHORT', 'DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT')""")
@@ -309,7 +322,7 @@ def cleanup_stale_dry_run_positions():
         tickers = {t.get("symbol"): t for t in get_tickers()}
         now = datetime.now()
         closed = 0
-        for trade_id, symbol, action, entry_price, size, leverage, confidence, opened_at in rows:
+        for trade_id, symbol, action, entry_price, size, leverage, confidence, opened_at, profile in rows:
             try:
                 opened_dt = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
             except Exception:
@@ -326,6 +339,7 @@ def cleanup_stale_dry_run_positions():
                 "size": size,
                 "leverage": leverage,
                 "confidence": confidence,
+                "profile": profile or "scalping",
                 "holdSide": hold_side,
             }
             pnl, fee, size, current, entry = estimate_position_net_pnl(position, current)
@@ -374,12 +388,13 @@ def clear_trailing_stop(symbol, hold_side):
 def get_dry_run_positions():
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence, opened_at
+        cur = conn.execute("""SELECT id, symbol, action, entry_price, size, leverage, confidence, opened_at, profile
             FROM trades WHERE closed_at IS NULL AND action IN ('DRY_LONG', 'DRY_SHORT', 'DRY_MANUAL_LONG', 'DRY_MANUAL_SHORT')""")
         rows = cur.fetchall()
         conn.close()
         return [{"id": r[0], "symbol": r[1], "action": r[2], "openPriceAvg": r[3],
                  "size": r[4], "leverage": r[5], "confidence": r[6], "opened_at": r[7],
+                 "profile": r[8] or "scalping",
                  "holdSide": direction_from_action(r[2])} for r in rows]
     except:
         return []
@@ -1367,7 +1382,12 @@ def analyze_top_signals(tickers, balance, force_open=False):
             history_tag += " | side_hist " + " / ".join(side_tags)
         market_rows.append(f"{symbol} | price={price} | volume_usdt={volume:.0f}{history_tag}")
     if not market_rows: return []
-    style_hint = "scalping" if TRADE_MODE == "scalping" else "normal trading"
+    if MAX_SCALP_POSITIONS > 0 and MAX_NORMAL_POSITIONS > 0:
+        style_hint = "hybrid (scalping + normal)"
+    elif TRADE_MODE == "normal":
+        style_hint = "normal trading"
+    else:
+        style_hint = "scalping"
     learning_context = get_learning_context()
     max_open_signals = FORCE_TRADE_ORDERS_PER_COMMAND if force_open else MAX_ORDERS_PER_CYCLE
     force_mode_rules = ""
@@ -1399,7 +1419,7 @@ Rules:
 3. OPEN can only be YES when confidence is at least {MIN_CONFIDENCE}.
 4. You decide pair, LONG/SHORT, leverage, margin USDT, position size in base coin, and if the pair is possible with ${balance:.4f}.
 5. Use the lowest leverage that can meet Bitget minimum notional about {MIN_NOTIONAL} USDT. Avoid high leverage; unsafe setups above {RISK_MAX_LEVERAGE}x will be rejected.
-6. In scalping mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas.
+6. In scalping/hybrid mode prefer fast momentum, tight structure, and cleaner entries over large trend ideas. In normal mode, larger trend ideas with wider stops are fine.
 7. Use the learning context to compare LONG and SHORT performance separately. Pick the side that current price action, momentum, and recent results support — neither side is preferred by default.
 8. If one direction has weak win rate AND non-positive average net PnL in recent trades, require stronger evidence before opening that direction. If a direction is on loss-streak cooldown (see context), do NOT open that side unless FORCE TRADE MODE is active.
 9. The per-pair and side history shown above is net of fees. A pair or specific side with avg PnL near zero or negative over multiple trades is a fee-eating churn.
@@ -1555,9 +1575,10 @@ def calculate_position_size(balance, signal, entry_price):
         return 0.0, 0.0, leverage
     return normalize_order_size(size), margin, leverage
 
-def auto_entry_allowed(signal, symbol, leverage, side_has_edge=False, side_edge_stats=None):
+def auto_entry_allowed(signal, symbol, leverage, side_has_edge=False, side_edge_stats=None, profile=None):
+    profile = str(profile or TRADE_MODE).strip().lower()
     confidence = parse_int(signal.get("confidence"), 0)
-    min_conf = AUTO_OPEN_CONFIDENCE_SCALPING if TRADE_MODE == "scalping" else AUTO_OPEN_CONFIDENCE_NORMAL
+    min_conf = AUTO_OPEN_CONFIDENCE_SCALPING if profile == "scalping" else AUTO_OPEN_CONFIDENCE_NORMAL
     recent_stats = get_recent_trade_stats()
     if (
         recent_stats["total"] >= RECENT_PROFIT_MIN_TRADES
@@ -1566,7 +1587,8 @@ def auto_entry_allowed(signal, symbol, leverage, side_has_edge=False, side_edge_
         min_conf += RECENT_DEFENSE_CONFIDENCE_BONUS
     if confidence < min_conf:
         return False, f"confidence {confidence}% below auto-open threshold {min_conf}%"
-    rr = TAKE_PROFIT_ROI_PCT / max(STOP_LOSS_ROI_PCT, 0.01)
+    prof_params = get_profile_params(profile)
+    rr = prof_params["take_profit_roi_pct"] / max(prof_params["stop_loss_roi_pct"], 0.01)
     if rr < MIN_REWARD_RISK_RATIO:
         return False, f"reward/risk {rr:.2f} below {MIN_REWARD_RISK_RATIO:.2f}"
     if leverage > PROFIT_GUARD_MAX_LEVERAGE and confidence < PROFIT_GUARD_MAX_LEVERAGE_CONFIDENCE:
@@ -1644,10 +1666,11 @@ def open_manual_trade(symbol, direction, margin_usdt=0.0, leverage=0):
         send_telegram(f"⚠️ Manual order failed for {symbol}: {res.get('msg')}")
         logger.error(f"Manual order failed for {symbol}: {res.get('msg')}")
 
-def calculate_roi_prices(entry_price, hold_side, leverage):
+def calculate_roi_prices(entry_price, hold_side, leverage, profile=None):
+    params = get_profile_params(profile or "scalping")
     hold_side = normalize_hold_side(hold_side)
-    price_move_tp = TAKE_PROFIT_ROI_PCT / (leverage * 100)
-    price_move_sl = STOP_LOSS_ROI_PCT / (leverage * 100)
+    price_move_tp = params["take_profit_roi_pct"] / (leverage * 100)
+    price_move_sl = params["stop_loss_roi_pct"] / (leverage * 100)
     if hold_side == "long":
         tp_price = entry_price * (1 + price_move_tp)
         sl_price = entry_price * (1 - price_move_sl)
@@ -1734,13 +1757,14 @@ def calculate_position_roi_pct(position):
     if margin <= 0: return 0.0
     return ((gross_pnl - fee) / margin) * 100
 
-def check_stop_loss(position, entry_price):
-    return calculate_position_roi_pct(position) <= -STOP_LOSS_ROI_PCT
+def check_stop_loss(position, entry_price, profile=None):
+    params = get_profile_params(profile or get_position_profile(position))
+    return calculate_position_roi_pct(position) <= -params["stop_loss_roi_pct"]
 
-def check_trailing_stop(position_key, current_roi_pct):
-    # Arm trailing only after the trade clears fees with margin to spare.
+def check_trailing_stop(position_key, current_roi_pct, profile=None):
+    params = get_profile_params(profile or "scalping")
     if position_key not in trailing_stops:
-        if current_roi_pct < TRAILING_ACTIVATE_ROI_PCT:
+        if current_roi_pct < params["trailing_activate_roi_pct"]:
             return False
         trailing_stops[position_key] = current_roi_pct
         return False
@@ -1748,12 +1772,10 @@ def check_trailing_stop(position_key, current_roi_pct):
     if current_roi_pct > highest:
         trailing_stops[position_key] = current_roi_pct
         return False
-    # Never trail-out below the minimum net-profit floor — otherwise we'd
-    # just be paying round-trip fees to scratch in and out.
-    if current_roi_pct < MIN_TRAILING_PROFIT_ROI_PCT:
+    if current_roi_pct < params["min_trailing_profit_roi_pct"]:
         return False
     drawdown_pct_of_peak = ((highest - current_roi_pct) / highest) * 100
-    return drawdown_pct_of_peak >= TRAILING_STOP_PCT
+    return drawdown_pct_of_peak >= params["trailing_stop_pct"]
 
 def get_position_size_value(position):
     size = parse_float(position.get("size"), 0.0)
@@ -1772,6 +1794,14 @@ def estimate_position_net_pnl(position, current_price=None):
         return 0.0, 0.0, 0.0, current_price, size
     net_pnl, fee = calculate_net_pnl(entry_price, current_price, size, hold_side)
     return net_pnl, fee, size, current_price, entry_price
+
+def get_profile_position_counts(positions):
+    counts = {"scalping": 0, "normal": 0}
+    for p in positions:
+        prof = get_position_profile(p)
+        if prof in counts:
+            counts[prof] += 1
+    return counts
 
 def find_and_trade():
     global last_trade_time, force_trade, force_open_trade, daily_loss_locked_date, consecutive_loss_cooldown_until
@@ -1835,6 +1865,14 @@ def find_and_trade():
         if force_open_requested:
             send_telegram(f"⚠️ <b>Force trade skipped</b>\nAuto positions already full: <b>{len(positions)}/{MAX_POSITIONS}</b>.")
         return
+    profile_counts = get_profile_position_counts(positions)
+    open_profiles = []
+    for prof, max_count in [("scalping", MAX_SCALP_POSITIONS), ("normal", MAX_NORMAL_POSITIONS)]:
+        if profile_counts[prof] < max_count:
+            open_profiles.append(prof)
+    if not open_profiles:
+        logger.info("All profiles at capacity; signals only")
+        return
     ticker_map = {t["symbol"]: t for t in candidates}
     existing_symbols = {p["symbol"] for p in positions}
     preferred = [s for s in signals if s["open"]]
@@ -1843,9 +1881,13 @@ def find_and_trade():
     max_per_run = FORCE_TRADE_ORDERS_PER_COMMAND if force_open_requested else MAX_ORDERS_PER_CYCLE
     max_to_open = min(max_per_run, MAX_POSITIONS - len(positions))
     for signal in order_candidates:
-        if opened >= max_to_open: break
+        if opened >= max_to_open:
+            break
         symbol = signal["symbol"]
-        if symbol in existing_symbols: continue
+        if symbol in existing_symbols:
+            continue
+        profile = open_profiles[0] if open_profiles else "scalping"
+        prof_params = get_profile_params(profile)
         side_has_edge, side_edge_stats = pair_direction_has_edge(symbol, signal["direction"])
         if force_open_requested:
             logger.warning(f"Force trade bypassing strategy filters for {symbol} {signal['direction']}")
@@ -1872,7 +1914,9 @@ def find_and_trade():
         if not force_open_requested and loss_streak:
             logger.info(f"Skipping {symbol} - pair cooldown ({loss_streak_reason})")
             continue
-        if not force_open_requested and (signal["confidence"] < MIN_CONFIDENCE or not signal["possible"]): continue
+        min_conf = prof_params["min_confidence"]
+        if not force_open_requested and (signal["confidence"] < min_conf or not signal["possible"]):
+            continue
         price = parse_float(ticker_map.get(symbol, {}).get("lastPr"), signal.get("price", 0.0))
         size, margin, leverage = calculate_position_size(balance, signal, price)
         notional = size * price
@@ -1880,7 +1924,7 @@ def find_and_trade():
             logger.info(f"Skipping {symbol} - cannot meet minimum with balance/leverage")
             continue
         if not force_open_requested:
-            allowed, guard_reason = auto_entry_allowed(signal, symbol, leverage, side_has_edge, side_edge_stats)
+            allowed, guard_reason = auto_entry_allowed(signal, symbol, leverage, side_has_edge, side_edge_stats, profile)
             if not allowed:
                 logger.info(f"Skipping {symbol} {signal['direction']} - profit guard: {guard_reason}")
                 continue
@@ -1890,23 +1934,26 @@ def find_and_trade():
         tp_price = signal.get("tp_price", 0.0)
         sl_price = signal.get("sl_price", 0.0)
         if not LLM_MANAGE_ENTRY or tp_price <= 0 or sl_price <= 0:
-            tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage)
+            tp_price, sl_price = calculate_roi_prices(price, hold_side, leverage, profile)
         if DRY_RUN:
             dry_action = f"DRY_{decision}"
-            save_trade_open(symbol, dry_action, price, size, leverage, confidence)
+            save_trade_open(symbol, dry_action, price, size, leverage, confidence, profile)
             last_trade_time = time.time()
             tp_roi = ((tp_price - price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((price - tp_price) / price * 100 * leverage) if price > 0 else 0
             sl_roi = ((price - sl_price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((sl_price - price) / price * 100 * leverage) if price > 0 else 0
-            msg = (f"🧪 <b>DRY RUN {decision} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
+            msg = (f"🧪 <b>DRY RUN {decision} OPENED ({profile.upper()})</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
                    f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
                    f"Leverage: <b>{leverage}x</b>\nConfidence: <b>{confidence}%</b>\n"
                    f"TP: <b>{tp_roi:+.2f}%</b> @ <b>{tp_price}</b>\n"
                    f"SL: <b>{sl_roi:+.2f}%</b> @ <b>{sl_price}</b>\n"
                    f"Fee model: <b>{TAKER_FEE_RATE * 100:.2f}% taker each side</b>\n\n💡 {reasoning}")
             send_telegram(msg)
-            logger.info(f"DRY RUN opened {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
+            logger.info(f"DRY RUN opened {profile} {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
             opened += 1
             existing_symbols.add(symbol)
+            profile_counts[profile] += 1
+            if profile_counts[profile] >= {"scalping": MAX_SCALP_POSITIONS, "normal": MAX_NORMAL_POSITIONS}.get(profile, 99):
+                open_profiles = [p for p in open_profiles if p != profile]
             continue
         lev_res = set_leverage(symbol, leverage, hold_side)
         if lev_res.get("code") != "00000":
@@ -1914,19 +1961,22 @@ def find_and_trade():
             continue
         res = place_order(symbol, side, size, hold_side, tp_price, sl_price)
         if res.get("code") == "00000":
-            save_trade_open(symbol, decision, price, size, leverage, confidence)
+            save_trade_open(symbol, decision, price, size, leverage, confidence, profile)
             last_trade_time = time.time()
             tp_roi = ((tp_price - price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((price - tp_price) / price * 100 * leverage) if price > 0 else 0
             sl_roi = ((price - sl_price) / price * 100 * leverage) if hold_side == "long" and price > 0 else ((sl_price - price) / price * 100 * leverage) if price > 0 else 0
-            msg = (f"🟢 <b>{decision} OPENED</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
+            msg = (f"🟢 <b>{decision} OPENED ({profile.upper()})</b>\nSymbol: <b>{symbol}</b>\nEntry: <b>{price:.6f}</b>\n"
                    f"Size: <b>{size}</b> | Margin: <b>{margin:.4f} USDT</b> | Notional: <b>{notional:.2f} USDT</b>\n"
                    f"Leverage: <b>{leverage}x</b>\nConfidence: <b>{confidence}%</b>\n"
                    f"TP: <b>{tp_roi:+.2f}%</b> @ <b>{tp_price}</b>\n"
                    f"SL: <b>{sl_roi:+.2f}%</b> @ <b>{sl_price}</b>\n\n💡 {reasoning}")
             send_telegram(msg)
-            logger.info(f"Opened {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
+            logger.info(f"Opened {profile} {decision} {symbol} @ {price} | Size: {size} | Lev: {leverage}x")
             opened += 1
             existing_symbols.add(symbol)
+            profile_counts[profile] += 1
+            if profile_counts[profile] >= {"scalping": MAX_SCALP_POSITIONS, "normal": MAX_NORMAL_POSITIONS}.get(profile, 99):
+                open_profiles = [p for p in open_profiles if p != profile]
         else:
             logger.error(f"Order failed for {symbol}: {res.get('msg')}")
     if opened == 0:
@@ -1949,6 +1999,8 @@ def manage_positions():
         symbol = p["symbol"]
         hold_side = normalize_hold_side(p.get("holdSide", "long"))
         p["holdSide"] = hold_side
+        profile = get_position_profile(p)
+        prof_params = get_profile_params(profile)
         entry = parse_float(p.get("openPriceAvg", 0), 0.0)
         trail_key = position_state_key(symbol, hold_side)
         if DRY_RUN:
@@ -1965,7 +2017,7 @@ def manage_positions():
             net_pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
             pnl = net_pnl if size > 0 else parse_float(p.get("unrealizedPL", 0), 0.0)
         roi_pct = calculate_position_roi_pct(p)
-        if roi_pct >= TAKE_PROFIT_ROI_PCT:
+        if roi_pct >= prof_params["take_profit_roi_pct"]:
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             ok, close_reason = close_position_succeeded(res, symbol, hold_side)
             if ok:
@@ -1994,7 +2046,7 @@ def manage_positions():
                     consecutive_losses = 0
                 continue
             logger.error(f"SL close failed for {hold_side} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
-        if check_trailing_stop(trail_key, roi_pct):
+        if check_trailing_stop(trail_key, roi_pct, profile):
             res = {"code": "00000"} if DRY_RUN else close_position_api(symbol, hold_side)
             ok, close_reason = close_position_succeeded(res, symbol, hold_side)
             if ok:
@@ -2039,11 +2091,16 @@ def manage_positions():
                 continue
             logger.error(f"Time-stop close failed for {hold_side} {symbol}: {close_reason} | response={json.dumps(res, ensure_ascii=False)}")
 
+def hybrid_mode_label():
+    if MAX_SCALP_POSITIONS > 0 and MAX_NORMAL_POSITIONS > 0:
+        return "HYBRID (SCALPING + NORMAL)"
+    return TRADE_MODE.upper()
+
 def handle_status(chat_id):
     positions, auto_positions, manual_count = get_position_counts()
     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
     real_balance = get_balance() if DRY_RUN else balance
-    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {hybrid_mode_label()}"
     if not positions:
         send_telegram_buttons(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>", [[("🔙 Menu", "menu:main")]], chat_id)
         return
@@ -2051,6 +2108,7 @@ def handle_status(chat_id):
     for p in positions:
         entry = parse_float(p.get("openPriceAvg", 0), 0.0)
         hold_side = normalize_hold_side(p.get("holdSide", "long"))
+        prof = get_position_profile(p).upper()
         if DRY_RUN:
             ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
             current = parse_float(ticker.get("lastPr"), entry)
@@ -2060,14 +2118,14 @@ def handle_status(chat_id):
             pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
         emoji = "🟢" if pnl > 0 else "🔴"
         pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
-        lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+        lines.append(f"{emoji} {hold_side.upper()} {p['symbol']} [{prof}]\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
     lines.append("")
     send_telegram_buttons("\n\n".join(lines), [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_balance(chat_id):
     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
     real_balance = get_balance() if DRY_RUN else balance
-    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {hybrid_mode_label()}"
     send_telegram_buttons(f"💰 <b>Balance</b>\nMode: <b>{mode}</b>\nAvailable: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>", [[("🔙 Menu", "menu:main")]], chat_id)
 
 def handle_history(chat_id):
@@ -2223,9 +2281,8 @@ def handle_commands():
                             f"<b>Settings:</b>\n"
                             f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
                             f"Provider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\n"
-                            f"Mode: {TRADE_MODE.upper()}\n"
+                            f"Mode: {hybrid_mode_label()}\n"
                             f"Auto TP/SL: {'✅' if LLM_MANAGE_ENTRY else '❌'}\n"
-                            f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                             f"Scan: every {SLEEP_MINUTES} min"
                         )
                         edit_message_buttons(chat_id, msg_id, msg, [[("🔙 Menu", "menu:main")]])
@@ -2278,7 +2335,7 @@ def handle_commands():
                     positions, auto_positions, manual_count = get_position_counts()
                     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
                     real_balance = get_balance() if DRY_RUN else balance
-                    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+                    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {hybrid_mode_label()}"
                     if not positions:
                         send_telegram(f"📊 <b>Status</b>\nMode: <b>{mode}</b>\nBalance: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nAuto positions: <b>0/{MAX_POSITIONS}</b>\nManual positions: <b>0</b>\nConsecutive losses: <b>{consecutive_losses}</b>")
                     else:
@@ -2286,6 +2343,7 @@ def handle_commands():
                         for p in positions:
                             entry = parse_float(p.get("openPriceAvg", 0), 0.0)
                             hold_side = normalize_hold_side(p.get("holdSide", "long"))
+                            prof = get_position_profile(p).upper()
                             if DRY_RUN:
                                 ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
                                 current = parse_float(ticker.get("lastPr"), entry)
@@ -2295,12 +2353,12 @@ def handle_commands():
                                 pnl, fee, size, current, entry = estimate_position_net_pnl(p, current)
                             emoji = "🟢" if pnl > 0 else "🔴"
                             pnl_pct = 0.0 if entry <= 0 else (((current - entry) / entry * 100) if hold_side == "long" else ((entry - current) / entry * 100))
-                            lines.append(f"{emoji} {hold_side.upper()} {p['symbol']}\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
+                            lines.append(f"{emoji} {hold_side.upper()} {p['symbol']} [{prof}]\nEntry: {entry:.6f} | Now: {current:.6f}\nNet PnL: <b>{pnl:.4f} USDT ({pnl_pct:+.2f}%)</b>\nEst. fees: <b>{fee:.4f} USDT</b>")
                         send_telegram("\n\n".join(lines))
                 elif text == "/balance":
                     balance, daily_pnl = get_strategy_balance(), get_strategy_today_net_pnl()
                     real_balance = get_balance() if DRY_RUN else balance
-                    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}"
+                    mode = f"{'DRY RUN' if DRY_RUN else 'LIVE'} / {hybrid_mode_label()}"
                     send_telegram(f"💰 <b>Balance</b>\nMode: <b>{mode}</b>\nAvailable: <b>{balance:.4f} USDT</b>\nReal balance: <b>{real_balance:.4f} USDT</b>\nDaily PnL: <b>{daily_pnl:.4f} USDT</b>\nMax daily loss: <b>{MAX_DAILY_LOSS_USD} USDT</b>")
                 elif text == "/history":
                     summary = get_trade_summary()
@@ -2450,9 +2508,8 @@ def handle_commands():
                         f"<b>Settings:</b>\n"
                         f"Trade: <b>{'PAPER' if DRY_RUN else 'LIVE'}</b>\n"
                         f"Provider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\n"
-                        f"Mode: {TRADE_MODE.upper()}\n"
+                        f"Mode: {hybrid_mode_label()}\n"
                         f"Auto TP/SL: {'✅' if LLM_MANAGE_ENTRY else '❌'}\n"
-                        f"TP: {TAKE_PROFIT_ROI_PCT:.0f}% | SL: {STOP_LOSS_ROI_PCT:.0f}%\n"
                         f"Scan: every {SLEEP_MINUTES} min",
                         [[("🔙 Menu", "menu:main")]])
             time.sleep(1)
@@ -2463,7 +2520,11 @@ def handle_commands():
 def main():
     global bot_running
     logger.info("=== Bitget LLM Bot V2 (Learning Edition) ===")
-    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()}</b>\nProvider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\nModel: <code>{active_llm_model()}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nAuto TP/SL: <b>{'✅' if LLM_MANAGE_ENTRY else '❌'}</b>\nTP: <b>{TAKE_PROFIT_ROI_PCT:.0f}%</b> | SL: <b>{STOP_LOSS_ROI_PCT:.0f}%</b>", main_menu())
+    scalping_tp = TRADE_PROFILES["scalping"]["take_profit_roi_pct"]
+    scalping_sl = TRADE_PROFILES["scalping"]["stop_loss_roi_pct"]
+    normal_tp = TRADE_PROFILES["normal"]["take_profit_roi_pct"]
+    normal_sl = TRADE_PROFILES["normal"]["stop_loss_roi_pct"]
+    send_telegram_buttons(f"🤖 <b>Bitget LLM Bot</b>\nMode: <b>{'PAPER' if DRY_RUN else 'LIVE'} / {hybrid_mode_label()}</b>\nProvider: <b>{LLM_PROVIDER_LABELS[LLM_PROVIDER]}</b>\nModel: <code>{active_llm_model()}</code>\nScan: <b>every {SLEEP_MINUTES} min</b>\nScalping: <b>TP {scalping_tp:.0f}% / SL {scalping_sl:.0f}%</b> (x{MAX_SCALP_POSITIONS})\nNormal: <b>TP {normal_tp:.0f}% / SL {normal_sl:.0f}%</b> (x{MAX_NORMAL_POSITIONS})", main_menu())
     init_db()
     cleanup_stale_dry_run_positions()
     t = threading.Thread(target=handle_commands, daemon=True)
@@ -2473,16 +2534,17 @@ def main():
             positions, auto_positions, manual_count = get_position_counts()
             balance = get_strategy_balance()
             real_balance = get_balance() if DRY_RUN else balance
-            logger.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'} / {TRADE_MODE.upper()} | Paper balance: {balance:.4f} | Real balance: {real_balance:.4f} | Auto positions: {len(auto_positions)}/{MAX_POSITIONS} | Manual positions: {manual_count}")
+            logger.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'} / {hybrid_mode_label()} | Paper balance: {balance:.4f} | Real balance: {real_balance:.4f} | Auto positions: {len(auto_positions)}/{MAX_POSITIONS} | Manual positions: {manual_count}")
             if positions:
                 for p in positions:
+                    prof = get_position_profile(p)
                     if DRY_RUN:
                         ticker = next((t for t in get_tickers() if t.get("symbol") == p["symbol"]), {})
                         entry = parse_float(p.get("openPriceAvg", 0), 0.0)
                         pnl, fee, size, current, entry = estimate_position_net_pnl(p, parse_float(ticker.get("lastPr"), entry))
                     else:
                         pnl, fee, size, current, entry = estimate_position_net_pnl(p, parse_float(p.get("markPrice", 0), 0.0))
-                    logger.info(f"Position: {p.get('holdSide','').upper()} {p['symbol']} | Net PnL: {pnl:.4f} | Est. fees: {fee:.4f}")
+                    logger.info(f"Position: {p.get('holdSide','').upper()} {p['symbol']} [{prof}] | Net PnL: {pnl:.4f} | Est. fees: {fee:.4f}")
                 manage_positions()
             find_and_trade()
             if DRY_RUN and get_strategy_positions():
