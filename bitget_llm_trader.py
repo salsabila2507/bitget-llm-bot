@@ -1860,26 +1860,31 @@ def find_and_trade():
         send_top_signals(signals, balance, len(positions), force=True)
     else:
         maybe_send_top_signals(signals, balance, len(positions))
-    if len(positions) >= MAX_POSITIONS:
-        logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}; signals only")
-        if force_open_requested:
-            send_telegram(f"⚠️ <b>Force trade skipped</b>\nAuto positions already full: <b>{len(positions)}/{MAX_POSITIONS}</b>.")
-        return
     profile_counts = get_profile_position_counts(positions)
     open_profiles = []
     for prof, max_count in [("scalping", MAX_SCALP_POSITIONS), ("normal", MAX_NORMAL_POSITIONS)]:
         if profile_counts[prof] < max_count:
             open_profiles.append(prof)
-    if not open_profiles:
-        logger.info("All profiles at capacity; signals only")
+    all_full = all(
+        profile_counts[prof] >= max_count
+        for prof, max_count in [("scalping", MAX_SCALP_POSITIONS), ("normal", MAX_NORMAL_POSITIONS)])
+    if len(positions) >= MAX_POSITIONS and all_full:
+        logger.info(f"Max positions reached: {len(positions)}/{MAX_POSITIONS}; signals only")
+        if force_open_requested:
+            send_telegram(f"⚠️ <b>Force trade skipped</b>\nAll profiles at capacity: {profile_counts}.")
         return
+
     ticker_map = {t["symbol"]: t for t in candidates}
     existing_symbols = {p["symbol"] for p in positions}
     preferred = [s for s in signals if s["open"]]
     order_candidates = signals if force_open_requested else preferred
     opened = 0
     max_per_run = FORCE_TRADE_ORDERS_PER_COMMAND if force_open_requested else MAX_ORDERS_PER_CYCLE
-    max_to_open = min(max_per_run, MAX_POSITIONS - len(positions))
+    available_slots = sum(
+        max(0, max_count - profile_counts[prof])
+        for prof, max_count in [("scalping", MAX_SCALP_POSITIONS), ("normal", MAX_NORMAL_POSITIONS)]
+    )
+    max_to_open = min(max_per_run, available_slots)
     for signal in order_candidates:
         if opened >= max_to_open:
             break
